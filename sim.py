@@ -46,6 +46,7 @@ def plot_attractor(points_sets):
 
 def plot_x_vs_t(points_sets):
     fig = plt.figure().add_subplot()
+    lyapunov_times = np.arange(len(points_sets[0].T[0])) * DT * LYAPUNOV_EXP
 
     for p in points_sets:
         xs = p.T[0]
@@ -66,9 +67,6 @@ if __name__ == "__main__":
     p1, p1_grad = data(0, 1, 1.05)
     p2, p2_grad = data(0.000001, 1, 1.05)
     points = [p1, p2]
-    lyapunov_times = np.arange(len(p1.T[0])) * DT * LYAPUNOV_EXP
-    norms = np.empty((TIMESTEPS + 1))
-
     norms = np.linalg.norm(p1_grad - p2_grad, axis=1)
 
     plot_attractor(points)
