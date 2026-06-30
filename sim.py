@@ -44,18 +44,17 @@ def plot_attractor(points_sets):
     for p in points_sets:
         ax.plot(*p.T, lw=0.5)
 
-def plot_x_vs_t():
-    x1s = p1.T[0]
-    x2s = p2.T[0]
-
+def plot_x_vs_t(points_sets):
     fig = plt.figure().add_subplot()
-    fig.plot(lyapunov_times, x1s, linestyle='-', color='b', linewidth=0.5)
-    fig.plot(lyapunov_times, x2s, linestyle='-', color='r', linewidth=0.5)
+
+    for p in points_sets:
+        xs = p.T[0]
+        fig.plot(lyapunov_times, xs, linestyle='-', linewidth=0.5)
 
     fig.set_xlabel("Lyapunov times (t / τ)")
     fig.set_ylabel("x")
 
-def plot_gradient_separation():
+def plot_gradient_separation(norms):
     fig = plt.figure().add_subplot()
     fig.semilogy(np.arange(len(p1.T[0])) * DT, norms, label="Exponential Growth", color="blue", linewidth=0.5)
 
@@ -66,12 +65,13 @@ def plot_gradient_separation():
 if __name__ == "__main__":
     p1, p1_grad = data(0, 1, 1.05)
     p2, p2_grad = data(0.000001, 1, 1.05)
+    points = [p1, p2]
     lyapunov_times = np.arange(len(p1.T[0])) * DT * LYAPUNOV_EXP
     norms = np.empty((TIMESTEPS + 1))
 
     norms = np.linalg.norm(p1_grad - p2_grad, axis=1)
 
-    # plot_attractor([p1, p2])
-    # plot_x_vs_t()
-    # plot_gradient_separation()
+    plot_attractor(points)
+    plot_x_vs_t(points)
+    plot_gradient_separation(norms)
     plt.show()
