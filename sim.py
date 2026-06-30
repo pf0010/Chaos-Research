@@ -9,17 +9,17 @@ TIMESTEPS = 5000
 DT = 0.01
 LYAPUNOV_EXP = 0.9056  # largest Lyapunov exponent for the classic Lorenz params
 
-def data(initial_x, initial_y, initial_z):
+def data(initial_x, initial_y, initial_z, steps=TIMESTEPS):
     dx, dy, dz = 0, 0, 0
     x, y, z = initial_x, initial_y, initial_z
 
-    points = np.empty((TIMESTEPS + 1, 3))
+    points = np.empty((steps + 1, 3))
     points[0] = (initial_x, initial_y, initial_z)
 
-    gradient = np.empty((TIMESTEPS + 1, 3))
+    gradient = np.empty((steps + 1, 3))
     gradient[0] = (dx, dy, dz)
 
-    for t in range(TIMESTEPS):
+    for t in range(steps):
         dx = PRANDTL * (y - x)
         dy = x * (RAYLEIGH - z) - y
         dz = x * y - B * z
@@ -32,18 +32,6 @@ def data(initial_x, initial_y, initial_z):
         gradient[t + 1] = (np.array([dx, dy, dz]))
 
     return points, gradient
-
-p1, p1_grad = data(0, 1, 1.05)
-p2, p2_grad = data(0.000001, 1, 1.05)
-lyapunov_times = np.arange(len(p1.T[0])) * DT * LYAPUNOV_EXP
-norms = np.empty((TIMESTEPS + 1))
-
-for t, (i, j) in enumerate(zip(p1_grad, p2_grad)):
-    dx1, dy1, dz1 = i
-    dx2, dy2, dz2 = j
-
-    norm = sqrt((dx1 - dx2) ** 2 + (dy1 - dy2) ** 2 + (dz1 - dz2) ** 2)
-    norms[t] = norm
 
 def plot_attractor(points_sets):
     ax = plt.figure().add_subplot(projection='3d')
@@ -70,12 +58,19 @@ def plot_gradient_separation():
     fig = plt.figure().add_subplot()
     fig.semilogy(np.arange(len(p1.T[0])) * DT, norms, label="Exponential Growth", color="blue", linewidth=0.5)
 
-    # fig.grid(True, which="both", linestyle="--") # Shows major and minor grid lines
     fig.set_xlabel("time")
     fig.set_ylabel("separation ‖∇1 − ∇2‖")
     fig.set_title("Gradient divergence")
 
-# plot_attractor([p1, p2])
-# plot_x_vs_t()
-# plot_gradient_separation()
-plt.show()
+if __name__ == "__main__":
+    p1, p1_grad = data(0, 1, 1.05)
+    p2, p2_grad = data(0.000001, 1, 1.05)
+    lyapunov_times = np.arange(len(p1.T[0])) * DT * LYAPUNOV_EXP
+    norms = np.empty((TIMESTEPS + 1))
+
+    norms = np.linalg.norm(p1_grad - p2_grad, axis=1)
+
+    # plot_attractor([p1, p2])
+    # plot_x_vs_t()
+    # plot_gradient_separation()
+    plt.show()
