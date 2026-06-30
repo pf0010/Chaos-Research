@@ -7,29 +7,30 @@ PRANDTL = 10
 B = 8 / 3
 TIMESTEPS = 5000
 DT = 0.01
-LYAPUNOV_EXP = 0.9056  # largest Lyapunov exponent for the classic Lorenz params
+LYAPUNOV_EXP = 0.9056
 
 def data(initial_x, initial_y, initial_z, steps=TIMESTEPS):
-    dx, dy, dz = 0, 0, 0
     x, y, z = initial_x, initial_y, initial_z
 
     points = np.empty((steps + 1, 3))
     points[0] = (initial_x, initial_y, initial_z)
 
     gradient = np.empty((steps + 1, 3))
-    gradient[0] = (dx, dy, dz)
 
     for t in range(steps):
         dx = PRANDTL * (y - x)
         dy = x * (RAYLEIGH - z) - y
         dz = x * y - B * z
 
+        gradient[t] = (dx, dy, dz)
+
         x += dx * DT
         y += dy * DT
         z += dz * DT
 
-        points[t + 1] = (np.array([x, y, z]))
-        gradient[t + 1] = (np.array([dx, dy, dz]))
+        points[t + 1] = (x, y, z)
+
+    gradient[steps] = (PRANDTL * (y - x), x * (RAYLEIGH - z) - y, x * y - B * z)
 
     return points, gradient
 
