@@ -1,6 +1,6 @@
 import matplotlib.pyplot as plt
 import numpy as np
-from math import sqrt
+import torch
 
 RAYLEIGH = 28
 PRANDTL = 10
@@ -9,7 +9,7 @@ TIMESTEPS = 5000
 DT = 0.01
 LYAPUNOV_EXP = 0.9056
 
-def data(initial_x, initial_y, initial_z, steps=TIMESTEPS):
+def array_data(initial_x, initial_y, initial_z, steps=TIMESTEPS, u=0.0):
     x, y, z = initial_x, initial_y, initial_z
 
     points = np.empty((steps + 1, 3))
@@ -18,7 +18,7 @@ def data(initial_x, initial_y, initial_z, steps=TIMESTEPS):
     gradient = np.empty((steps + 1, 3))
 
     for t in range(steps):
-        dx = PRANDTL * (y - x)
+        dx = PRANDTL * (y - x) + u
         dy = x * (RAYLEIGH - z) - y
         dz = x * y - B * z
 
@@ -30,46 +30,64 @@ def data(initial_x, initial_y, initial_z, steps=TIMESTEPS):
 
         points[t + 1] = (x, y, z)
 
-    gradient[steps] = (PRANDTL * (y - x), x * (RAYLEIGH - z) - y, x * y - B * z)
+    gradient[steps] = (PRANDTL * (y - x) + u, x * (RAYLEIGH - z) - y, x * y - B * z)
 
     return points, gradient
 
-def plot_attractor(points_sets):
-    ax = plt.figure().add_subplot(projection='3d')
-    ax.set_xlabel('X Axis')
-    ax.set_ylabel('Y Axis')
-    ax.set_zlabel('Z Axis')
-    ax.set_title("Lorenz Attractor")
+def tensor_data(initial_x, initial_y, initial_z, ut, steps=TIMESTEPS):
+    x = torch.tensor(initial_x, dtype=torch.float64)
+    y = torch.tensor(initial_y, dtype=torch.float64)
+    z = torch.tensor(initial_z, dtype=torch.float64)
 
-    for p in points_sets:
-        ax.plot(*p.T, lw=0.5)
+    points = [torch.stack((x, y, z))]
 
-def plot_x_vs_t(points_sets):
-    fig = plt.figure().add_subplot()
-    lyapunov_times = np.arange(len(points_sets[0].T[0])) * DT * LYAPUNOV_EXP
+    for _ in range(steps):
+        dx = PRANDTL * (y - x) + ut
+        dy = x * (RAYLEIGH - z) - y
+        dz = x * y - B * z
 
-    for p in points_sets:
-        xs = p.T[0]
-        fig.plot(lyapunov_times, xs, linestyle='-', linewidth=0.5)
+        x = x + dx * DT
+        y = y + dy * DT
+        z = z + dz * DT
 
-    fig.set_xlabel("Lyapunov times (t / τ)")
-    fig.set_ylabel("x")
+        points.append(torch.stack((x, y, z)))
 
-def plot_gradient_separation(norms):
-    fig = plt.figure().add_subplot()
-    fig.semilogy(np.arange(len(p1.T[0])) * DT, norms, label="Exponential Growth", color="blue", linewidth=0.5)
+    return torch.stack(points)
 
-    fig.set_xlabel("time")
-    fig.set_ylabel("separation ‖∇1 − ∇2‖")
-    fig.set_title("Gradient divergence")
+def position_gradient(initial_x, initial_y, initial_z, ut, lyapunov_times=1.0, coord=0):
+    steps = round(lyapunov_times / (LYAPUNOV_EXP * DT))
+    traj = tensor_data(initial_x, initial_y, initial_z, ut, steps=steps)
+
+    grad, = torch.autograd.grad(traj[steps][coord], ut)
+
+    return traj[steps].detach().numpy(), grad.item()
+
+def calculate_loss(p):
+    x = p[:, 0]
+    loss = (torch.relu(-x) ** 2).mean()
+
+    return loss
+
+def optimize_gradient(u, lyapunov_times=1.0):
+    ITERS = 300
+    steps = round(lyapunov_times / (LYAPUNOV_EXP * DT))   # horizon, kept short
+    opt = torch.optim.Adam([u])
+
+    for i in range(ITERS):
+        opt.zero_grad()
+        traj = tensor_data(0, 1, 1.05, u, steps=steps)
+        loss = calculate_loss(traj)
+        loss.backward()
+        opt.step()
+
+        if i % 20 == 0:
+            print(f"iter {i:4d}  loss {loss.item():.6e}  u {u.item():+.4f}")
+
+    return u.item()
+
 
 if __name__ == "__main__":
-    p1, p1_grad = data(0, 1, 1.05)
-    p2, p2_grad = data(0.000001, 1, 1.05)
-    points = [p1, p2]
-    norms = np.linalg.norm(p1_grad - p2_grad, axis=1)
-
-    plot_attractor(points)
-    plot_x_vs_t(points)
-    plot_gradient_separation(norms)
-    plt.show()
+    p1u = 0
+    # p2u = 1
+    u1 = torch.tensor(1, requires_grad=True, dtype=torch.float64)
+    optimize_gradient(u1)
