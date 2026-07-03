@@ -69,9 +69,9 @@ def calculate_loss(p):
     return loss
 
 def optimize_gradient(u, lyapunov_times=1.0):
-    ITERS = 300
+    ITERS = 600
     steps = round(lyapunov_times / (LYAPUNOV_EXP * DT))   # horizon, kept short
-    opt = torch.optim.Adam([u])
+    opt = torch.optim.Adam([u], lr=0.1)
 
     for i in range(ITERS):
         opt.zero_grad()
@@ -81,7 +81,7 @@ def optimize_gradient(u, lyapunov_times=1.0):
         opt.step()
 
         if i % 20 == 0:
-            print(f"iter {i:4d}  loss {loss.item():.6e}  u {u.item():+.4f}")
+            print(f"iter {i:4d}  loss {loss.item():.4f}  u {u.item():+.4f}")
 
     return u.item()
 
