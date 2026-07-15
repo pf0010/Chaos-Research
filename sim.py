@@ -1,4 +1,3 @@
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
@@ -8,6 +7,7 @@ B = 8 / 3
 TIMESTEPS = 5000
 DT = 0.01
 LYAPUNOV_EXP = 0.9056
+EPS = 2.0
 
 def array_data(initial_x, initial_y, initial_z, steps=TIMESTEPS, u=0.0):
     x, y, z = initial_x, initial_y, initial_z
@@ -34,23 +34,33 @@ def array_data(initial_x, initial_y, initial_z, steps=TIMESTEPS, u=0.0):
 
     return points, gradient
 
-def tensor_data(initial_x, initial_y, initial_z, ut, steps=TIMESTEPS):
-    x = torch.tensor(initial_x, dtype=torch.float64)
-    y = torch.tensor(initial_y, dtype=torch.float64)
-    z = torch.tensor(initial_z, dtype=torch.float64)
+def create_controller():
+    w = torch.zeros(3, dtype=torch.float64, requires_grad=True)
+    b = torch.zeros((), dtype=torch.float64, requires_grad=True)
 
-    points = [torch.stack((x, y, z))]
+    return w, b
+
+def control_force(state, params):
+    w, b = params
+    return torch.dot(w, state) + b
+
+def tensor_data(initial_x, initial_y, initial_z, control, steps=TIMESTEPS):
+    state = torch.tensor([initial_x, initial_y, initial_z], dtype=torch.float64)
+
+    points = [state]
 
     for _ in range(steps):
+        x, y, z = state
+
+        ut = control(state) if callable(control) else control
+
         dx = PRANDTL * (y - x) + ut
         dy = x * (RAYLEIGH - z) - y
         dz = x * y - B * z
 
-        x = x + dx * DT
-        y = y + dy * DT
-        z = z + dz * DT
+        state = state + torch.stack((dx, dy, dz)) * DT
 
-        points.append(torch.stack((x, y, z)))
+        points.append(state)
 
     return torch.stack(points)
 
@@ -62,32 +72,40 @@ def position_gradient(initial_x, initial_y, initial_z, ut, lyapunov_times=1.0, c
 
     return traj[steps].detach().numpy(), grad.item()
 
-def calculate_loss(p):
+def phi(x, eps=EPS):
+    tanh = torch.tanh if isinstance(x, torch.Tensor) else np.tanh
+
+    return 0.5 * (1 + tanh(x / eps))
+
+def calculate_loss(p, eps=EPS):
     x = p[:, 0]
-    loss = (torch.relu(-x) ** 2).mean()
+    # loss = (torch.relu(-x) ** 2).mean()
 
-    return loss
+    return phi(x, eps).mean()
 
-def optimize_gradient(u, lyapunov_times=1.0):
-    ITERS = 600
-    steps = round(lyapunov_times / (LYAPUNOV_EXP * DT))   # horizon, kept short
-    opt = torch.optim.Adam([u], lr=0.1)
+def optimize_gradient(params=None, lyapunov_times=1.0, iters=600, lr=0.1):
+    steps = round(lyapunov_times / (LYAPUNOV_EXP * DT))
 
-    for i in range(ITERS):
+    if params is None:
+        params = create_controller()
+
+    opt = torch.optim.Adam(params, lr=lr)
+
+    for i in range(iters):
         opt.zero_grad()
-        traj = tensor_data(0, 1, 1.05, u, steps=steps)
+        traj = tensor_data(0, 1, 1.05, lambda s: control_force(s, params), steps=steps)
         loss = calculate_loss(traj)
         loss.backward()
         opt.step()
 
         if i % 20 == 0:
-            print(f"iter {i:4d}  loss {loss.item():.4f}  u {u.item():+.4f}")
+            w, b = params
+            print(f"iter {i:4d}  loss {loss.item():.4f}   "
+                  f"w {w.detach().numpy().round(3)}   b {b.item():+.3f}")
 
-    return u.item()
+    return params
 
 
 if __name__ == "__main__":
-    p1u = 0
-    # p2u = 1
-    u1 = torch.tensor(1, requires_grad=True, dtype=torch.float64)
-    optimize_gradient(u1)
+    w, b = optimize_gradient(lr=0.02)
+    print("learned feedback law: w =", w.detach().numpy(), ". (x,y,z) +", b.item())
