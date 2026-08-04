@@ -81,7 +81,7 @@ def calculate_loss(p, eps=EPS):
     x = p[:, 0]
     # loss = (torch.relu(-x) ** 2).mean()
 
-    return phi(x, eps).mean()
+    return (1 - phi(x, eps)).mean()
 
 def optimize_gradient(params=None, lyapunov_times=1.0, iters=600, lr=0.1):
     steps = round(lyapunov_times / (LYAPUNOV_EXP * DT))
@@ -93,7 +93,7 @@ def optimize_gradient(params=None, lyapunov_times=1.0, iters=600, lr=0.1):
 
     for i in range(iters):
         opt.zero_grad()
-        traj = tensor_data(0, 1, 1.05, lambda s: control_force(s, params), steps=steps)
+        traj = tensor_data(-0.1, 1, 1.05, lambda s: control_force(s, params), steps=steps)
         loss = calculate_loss(traj)
         loss.backward()
         opt.step()
