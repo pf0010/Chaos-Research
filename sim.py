@@ -8,6 +8,8 @@ TIMESTEPS = 5000
 DT = 0.01
 LYAPUNOV_EXP = 0.9056
 EPS = 2.0
+U_REF = 60.0
+LAMBDA = 0.007
 
 def array_data(initial_x, initial_y, initial_z, steps=TIMESTEPS, u=0.0):
     x, y, z = initial_x, initial_y, initial_z
@@ -79,11 +81,19 @@ def phi(x, eps=EPS):
 
 def calculate_loss(p, eps=EPS):
     x = p[:, 0]
-    # loss = (torch.relu(-x) ** 2).mean()
 
     return (1 - phi(x, eps)).mean()
 
-def optimize_gradient(params=None, lyapunov_times=1.0, iters=600, lr=0.1):
+def control_effort(p, params, u_ref=U_REF):
+    w, b = params
+
+    # the control at the final state is never applied, so drop it
+    u = p[:-1] @ w + b
+
+    return (u / u_ref).pow(2).mean()
+
+def optimize_gradient(ic=[0, 1, 1.05], params=None, lyapunov_times=1.0, iters=600, lr=0.1, lam=LAMBDA,
+                      regularized=False):
     steps = round(lyapunov_times / (LYAPUNOV_EXP * DT))
 
     if params is None:
@@ -93,14 +103,22 @@ def optimize_gradient(params=None, lyapunov_times=1.0, iters=600, lr=0.1):
 
     for i in range(iters):
         opt.zero_grad()
-        traj = tensor_data(-0.1, 1, 1.05, lambda s: control_force(s, params), steps=steps)
-        loss = calculate_loss(traj)
+        traj = tensor_data(*ic, lambda s: control_force(s, params), steps=steps)
+        task = calculate_loss(traj)
+        effort = control_effort(traj, params)
+
+        if regularized == "l2":
+            loss = task + lam * effort
+        else:
+            loss = task
         loss.backward()
         opt.step()
 
         if i % 20 == 0:
             w, b = params
-            print(f"iter {i:4d}  loss {loss.item():.4f}   "
+            rms = U_REF * effort.item() ** 0.5
+            print(f"iter {i:4d}  loss {loss.item():.4f}   task {task.item():.4f}   "
+                  f"pen {lam * effort.item():.4f}   |u|rms {rms:7.2f}   "
                   f"w {w.detach().numpy().round(3)}   b {b.item():+.3f}")
 
     return params
