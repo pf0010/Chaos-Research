@@ -123,7 +123,7 @@ def optimize_gradient(
         task = calculate_loss(traj)
         effort = control_effort(traj, params)
 
-        if regularized == "l2":
+        if regularized:
             loss = task + lam * effort
         else:
             loss = task

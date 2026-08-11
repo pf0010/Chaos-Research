@@ -75,7 +75,7 @@ def controller_actions(points, params):
     return (pts.detach().to(torch.float64) @ w.detach() + b.detach()).numpy()
 
 
-def plot_control(params, initial=(0, 1, 1.05), steps=300):
+def plot_control(params, initial=(0, 1, 1.05), steps=300, regularized=False):
     # COLORS = ("green", "orange", "black")
     traj = tensor_data(*initial, lambda s: control_force(s, params), steps=steps)
     pts = traj.detach().numpy()
@@ -85,10 +85,16 @@ def plot_control(params, initial=(0, 1, 1.05), steps=300):
     fig, (ax_traj, ax_u) = plt.subplots(2, 1, sharex=True, figsize=(10, 7))
 
     ax_traj.axhline(0, color="black", linestyle="--", linewidth=1)
-    for i, label in enumerate("x"):
+    for i, label in enumerate("xyz"):
         ax_traj.plot(lyapunov_times, pts[:, i], linewidth=0.6, label=label)
     ax_traj.set_ylabel("state")
-    ax_traj.set_title("Controlled Lorenz trajectory")
+
+    title = "Controlled Lorenz trajectory"
+
+    if regularized:
+        title += " (regularized)"
+
+    ax_traj.set_title(title)
     ax_traj.legend(loc="upper right")
 
     ax_u.axhline(0, color="black", linestyle="--", linewidth=1)
@@ -100,16 +106,21 @@ def plot_control(params, initial=(0, 1, 1.05), steps=300):
     fig.tight_layout()
 
 
-def plot_control_attractor(params, initial=(0, 1, 1.05), steps=300):
+def plot_control_attractor(params, initial=(0, 1, 1.05), steps=300, regularized=False):
     traj = tensor_data(*initial, lambda s: control_force(s, params), steps=steps)
     pts = traj.detach().numpy()
     us = controller_actions(traj, params)
 
-    ax = plt.figure().add_subplot(projection="3d")
+    ax = plt.figure(figsize=(11, 7)).add_subplot(projection="3d")
     ax.set_xlabel("X Axis")
     ax.set_ylabel("Y Axis")
     ax.set_zlabel("Z Axis")
-    ax.set_title("Controlled trajectory (colored by control u)")
+
+    title = "Controlled trajectory"
+
+    if regularized:
+        title += " (regularized)"
+    ax.set_title(title)
 
     segments = np.stack([pts[:-1], pts[1:]], axis=1)
     lc = Line3DCollection(segments, cmap="coolwarm", linewidths=0.8)
@@ -118,7 +129,7 @@ def plot_control_attractor(params, initial=(0, 1, 1.05), steps=300):
 
     ax.auto_scale_xyz(pts[:, 0], pts[:, 1], pts[:, 2])
 
-    ax.figure.colorbar(lc, ax=ax, shrink=0.6, label="control u")
+    ax.figure.colorbar(lc, ax=ax, shrink=0.6, pad=0.11, label="control u")
 
 
 def plot_gradient_growth(
@@ -168,9 +179,9 @@ def plot_gradient_vs_window(ic=(0, 1, 1.05), max_lt=8.0, n=50, save=False):
 
     if save:
         plt.savefig(
-            f"./plots/gradient_growth_{int(max_lt)}.png", dpi=150, bbox_inches="tight"
+            f"./plots/gradient_growth/{int(max_lt)}.png", dpi=150, bbox_inches="tight"
         )
-        print(f"Saved to ./plots/gradient_growth_{int(max_lt)}.png")
+        print(f"Saved to ./plots/gradient_growth/{int(max_lt)}.png")
     else:
         plt.show()
 
@@ -196,6 +207,7 @@ def control_plots(
     plot_lyapunov_times=25,
     iters=600,
     regularized=False,
+    save=False,
 ):
     params = optimize_gradient(
         ic=ic,
@@ -206,9 +218,24 @@ def control_plots(
     )
 
     steps = round(plot_lyapunov_times / (LYAPUNOV_EXP * DT))
-    plot_control(params, steps=steps)
-    plot_control_attractor(params, steps=steps)
-    plt.show()
+
+    if save:
+        path = f"./plots/control/"
+        filename = f"{train_lyapunov_times}"
+
+        if regularized:
+            filename += "_regularized"
+        else:
+            filename += "_unregularized"
+
+        plot_control(params, steps=steps, regularized=regularized)
+        plt.savefig(path + filename + "_traj.png", dpi=150, bbox_inches="tight")
+        plot_control_attractor(params, steps=steps, regularized=regularized)
+        plt.savefig(path + filename + "_attractor.png", dpi=150, bbox_inches="tight")
+    else:
+        plot_control(params, steps=steps, regularized=regularized)
+        plot_control_attractor(params, steps=steps, regularized=regularized)
+        plt.show()
 
 
 if __name__ == "__main__":
@@ -222,6 +249,7 @@ if __name__ == "__main__":
     parser.add_argument("-i", "--iters", type=int, default=600)
     parser.add_argument("-l2", "--l2_regularized", action="store_true")
     parser.add_argument("-gg", "--gradient_growth", type=float, default=0)
+    parser.add_argument("-s", "--save", action="store_true")
     args = parser.parse_args()
 
     if args.gradient_growth:
@@ -234,4 +262,5 @@ if __name__ == "__main__":
             plot_lyapunov_times=args.plot_lyapunov_times,
             iters=args.iters,
             regularized=args.l2_regularized,
+            save=args.save,
         )
