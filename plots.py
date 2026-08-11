@@ -100,25 +100,6 @@ def plot_control_attractor(params, initial=(0, 1, 1.05), steps=300):
     ax.figure.colorbar(lc, ax=ax, shrink=0.6, label="control u")
 
 
-def plot_forcing_gradient(ic=(0, 1, 1.05), lyapunov_times=1.0, eps=EPS):
-    traj, grad = forcing_gradient(*ic, lyapunov_times=lyapunov_times, eps=eps)
-    times = np.arange(len(grad)) * DT * LYAPUNOV_EXP
-
-    fig, (ax_g, ax_x) = plt.subplots(2, 1, sharex=True, figsize=(10, 7))
-
-    ax_g.semilogy(times, np.abs(grad), color="red", linewidth=0.5)
-    ax_g.set_ylabel("|∂L / ∂u(t)|")
-    ax_g.set_title(f"Loss sensitivity to forcing (horizon {lyapunov_times} τ, ε = {eps})")
-
-    ax_x.axhline(0, color="black", linestyle="--", linewidth=1)
-    ax_x.plot(times, traj[:-1, 0], linewidth=0.6, label="x")
-    ax_x.set_ylabel("x")
-    ax_x.set_xlabel("Lyapunov times (t / τ)")
-    ax_x.legend(loc="upper right")
-
-    fig.tight_layout()
-
-
 def plot_gradient_growth(initial_x, initial_y, initial_z, ut, lyapunov_times=1.0, coord=0):
     horizons = np.linspace(0.1, lyapunov_times, 40)
     grads = [position_gradient(initial_x, initial_y, initial_z, ut, lyapunov_times=lt, coord=coord)[1]
