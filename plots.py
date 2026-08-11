@@ -3,36 +3,45 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d.art3d import Line3DCollection
 import argparse
 
+
 def plot_attractor(points_sets):
-    ax = plt.figure().add_subplot(projection='3d')
-    ax.set_xlabel('X Axis')
-    ax.set_ylabel('Y Axis')
-    ax.set_zlabel('Z Axis')
+    ax = plt.figure().add_subplot(projection="3d")
+    ax.set_xlabel("X Axis")
+    ax.set_ylabel("Y Axis")
+    ax.set_zlabel("Z Axis")
     ax.set_title("Lorenz Attractor")
 
     for p in points_sets:
         ax.plot(*p.T, lw=0.5)
 
+
 def plot_x_vs_t(points_sets):
     fig = plt.figure().add_subplot()
-    fig.axhline(0, color='black', linestyle='--', linewidth=1)
+    fig.axhline(0, color="black", linestyle="--", linewidth=1)
     lyapunov_times = np.arange(len(points_sets[0].T[0])) * DT * LYAPUNOV_EXP
 
     for i, p in enumerate(points_sets):
         xs = p.T[0]
-        fig.plot(lyapunov_times, xs, linestyle='-', linewidth=0.5, label=f"p{i + 1}")
+        fig.plot(lyapunov_times, xs, linestyle="-", linewidth=0.5, label=f"p{i + 1}")
 
     fig.set_xlabel("Lyapunov times (t / τ)")
     fig.set_ylabel("x")
     fig.legend()
 
+
 def plot_phi_vs_t(points_sets, eps=EPS):
     fig = plt.figure().add_subplot()
-    fig.axhline(0.5, color='black', linestyle='--', linewidth=1)
+    fig.axhline(0.5, color="black", linestyle="--", linewidth=1)
     lyapunov_times = np.arange(len(points_sets[0].T[0])) * DT * LYAPUNOV_EXP
 
     for i, p in enumerate(points_sets):
-        fig.plot(lyapunov_times, phi(p.T[0], eps), linestyle='-', linewidth=0.5, label=f"p{i + 1}")
+        fig.plot(
+            lyapunov_times,
+            phi(p.T[0], eps),
+            linestyle="-",
+            linewidth=0.5,
+            label=f"p{i + 1}",
+        )
 
     fig.set_ylim(-0.05, 1.05)
     fig.set_xlabel("Lyapunov times (t / τ)")
@@ -40,17 +49,29 @@ def plot_phi_vs_t(points_sets, eps=EPS):
     fig.set_title(f"Soft lobe indicator (ε = {eps})")
     fig.legend()
 
+
 def plot_gradient_separation(norms):
     fig = plt.figure().add_subplot()
-    fig.semilogy(np.arange(len(norms)) * DT, norms, label="Exponential Growth", color="blue", linewidth=0.5)
+    fig.semilogy(
+        np.arange(len(norms)) * DT,
+        norms,
+        label="Exponential Growth",
+        color="blue",
+        linewidth=0.5,
+    )
 
     fig.set_xlabel("time")
     fig.set_ylabel("separation ‖∇1 − ∇2‖")
     fig.set_title("Gradient divergence")
 
+
 def controller_actions(points, params):
     w, b = params
-    pts = points if isinstance(points, torch.Tensor) else torch.as_tensor(np.asarray(points))
+    pts = (
+        points
+        if isinstance(points, torch.Tensor)
+        else torch.as_tensor(np.asarray(points))
+    )
     return (pts.detach().to(torch.float64) @ w.detach() + b.detach()).numpy()
 
 
@@ -100,21 +121,58 @@ def plot_control_attractor(params, initial=(0, 1, 1.05), steps=300):
     ax.figure.colorbar(lc, ax=ax, shrink=0.6, label="control u")
 
 
-def plot_gradient_growth(initial_x, initial_y, initial_z, ut, lyapunov_times=1.0, coord=0):
+def plot_gradient_growth(
+    initial_x, initial_y, initial_z, ut, lyapunov_times=1.0, coord=0
+):
     horizons = np.linspace(0.1, lyapunov_times, 40)
-    grads = [position_gradient(initial_x, initial_y, initial_z, ut, lyapunov_times=lt, coord=coord)[1]
-             for lt in horizons]
+    grads = [
+        position_gradient(
+            initial_x, initial_y, initial_z, ut, lyapunov_times=lt, coord=coord
+        )[1]
+        for lt in horizons
+    ]
 
     fig = plt.figure().add_subplot()
     fig.semilogy(horizons, np.abs(grads), color="red", linewidth=0.5)
-    fig.plot(horizons, np.exp(np.asarray(horizons)), linestyle="--", color="gray",
-             linewidth=0.5, label="e^(t/τ)")
+    fig.plot(
+        horizons,
+        np.exp(np.asarray(horizons)),
+        linestyle="--",
+        color="gray",
+        linewidth=0.5,
+        label="e^(t/τ)",
+    )
 
     fig.set_xlabel("Lyapunov times (t / τ)")
     fig.set_ylabel("|∂x(t) / ∂u|")
     fig.set_title("Gradient growth vs. horizon")
     fig.legend()
     plt.show()
+
+
+def plot_gradient_vs_window(ic=(0, 1, 1.05), max_lt=8.0, n=50, save=False):
+    windows = np.linspace(0.1, max_lt, n)
+    norms = []
+    for lt in windows:
+        params = create_controller()
+        steps = round(lt / (LYAPUNOV_EXP * DT))
+        traj = tensor_data(*ic, lambda s: control_force(s, params), steps=steps)
+        g = torch.autograd.grad(calculate_loss(traj), params)
+        norms.append(torch.cat([gi.reshape(-1) for gi in g]).norm().item())
+
+    ax = plt.figure().add_subplot()
+    ax.semilogy(windows, norms, color="red", linewidth=0.8)
+    ax.set_xlabel("Lyapunov times (t / τ)")
+    ax.set_ylabel("Loss-gradient")
+    ax.set_title("Loss-gradient blowup vs. training window")
+
+    if save:
+        plt.savefig(
+            f"./plots/gradient_growth_{int(max_lt)}.png", dpi=150, bbox_inches="tight"
+        )
+        print(f"Saved to ./plots/gradient_growth_{int(max_lt)}.png")
+    else:
+        plt.show()
 
 
 def lorenz_plots():
@@ -130,26 +188,50 @@ def lorenz_plots():
     # plot_gradient_separation(norms)
     plt.show()
 
-def control_plots(ic=[0, 1, 1.05], lr=0.05, train_lyapunov_times=1.0, plot_lyapunov_times=25,
-                  iters=600, regularized=False):
-    params = optimize_gradient(ic=ic, lr=lr, lyapunov_times=train_lyapunov_times, iters=iters,
-                               regularized=regularized)
+
+def control_plots(
+    ic=[0, 1, 1.05],
+    lr=0.05,
+    train_lyapunov_times=1.0,
+    plot_lyapunov_times=25,
+    iters=600,
+    regularized=False,
+):
+    params = optimize_gradient(
+        ic=ic,
+        lr=lr,
+        lyapunov_times=train_lyapunov_times,
+        iters=iters,
+        regularized=regularized,
+    )
 
     steps = round(plot_lyapunov_times / (LYAPUNOV_EXP * DT))
     plot_control(params, steps=steps)
     plot_control_attractor(params, steps=steps)
     plt.show()
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("-ic", "--initial_condition", nargs=3, type=float, default=[0, 1, 1.05])
+    parser.add_argument(
+        "-ic", "--initial_condition", nargs=3, type=float, default=[0, 1, 1.05]
+    )
     parser.add_argument("-lr", "--learning_rate", type=float, default=0.05)
     parser.add_argument("-tlt", "--train_lyapunov_times", type=float, default=1)
     parser.add_argument("-plt", "--plot_lyapunov_times", type=float, default=100)
     parser.add_argument("-i", "--iters", type=int, default=600)
-    parser.add_argument("-l2", "--l2_regularized", action='store_const', const="l2")
+    parser.add_argument("-l2", "--l2_regularized", action="store_true")
+    parser.add_argument("-gg", "--gradient_growth", type=float, default=0)
     args = parser.parse_args()
 
-    control_plots(ic=args.initial_condition, lr=args.learning_rate, train_lyapunov_times=args.train_lyapunov_times,
-                  plot_lyapunov_times=args.plot_lyapunov_times, iters=args.iters,
-                  regularized=args.l2_regularized)
+    if args.gradient_growth:
+        plot_gradient_vs_window(ic=args.initial_condition, max_lt=args.gradient_growth)
+    else:
+        control_plots(
+            ic=args.initial_condition,
+            lr=args.learning_rate,
+            train_lyapunov_times=args.train_lyapunov_times,
+            plot_lyapunov_times=args.plot_lyapunov_times,
+            iters=args.iters,
+            regularized=args.l2_regularized,
+        )
