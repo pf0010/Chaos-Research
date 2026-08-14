@@ -12,28 +12,64 @@ U_REF = 60.0
 LAMBDA = 0.007
 
 
+def lorenz(state, u=0.0):
+    x, y, z = state[0], state[1], state[2]
+
+    dx = PRANDTL * (y - x) + u
+    dy = x * (RAYLEIGH - z) - y
+    dz = x * y - B * z
+
+    if isinstance(state, torch.Tensor):
+        return torch.stack((dx, dy, dz))
+
+    return np.array((dx, dy, dz))
+
+
+def control_input(control, state):
+    return control(state) if callable(control) else control
+
+
+def euler_step(state, control, dt=DT):
+    k1 = lorenz(state, control_input(control, state))
+
+    return state + dt * k1, k1
+
+
+def rk4_step(state, control, dt=DT):
+    # the control is re-evaluated at every stage, so this integrates the
+    # closed-loop field rather than holding u fixed across the step
+    k1 = lorenz(state, control_input(control, state))
+
+    s2 = state + 0.5 * dt * k1
+    k2 = lorenz(s2, control_input(control, s2))
+
+    s3 = state + 0.5 * dt * k2
+    k3 = lorenz(s3, control_input(control, s3))
+
+    s4 = state + dt * k3
+    k4 = lorenz(s4, control_input(control, s4))
+
+    return state + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4), k1
+
+
+STEP = rk4_step
+
+
 def array_data(initial_x, initial_y, initial_z, steps=TIMESTEPS, u=0.0):
-    x, y, z = initial_x, initial_y, initial_z
+    state = np.array((initial_x, initial_y, initial_z), dtype=float)
 
     points = np.empty((steps + 1, 3))
-    points[0] = (initial_x, initial_y, initial_z)
+    points[0] = state
 
     gradient = np.empty((steps + 1, 3))
 
     for t in range(steps):
-        dx = PRANDTL * (y - x) + u
-        dy = x * (RAYLEIGH - z) - y
-        dz = x * y - B * z
+        state, k1 = STEP(state, u)
 
-        gradient[t] = (dx, dy, dz)
+        gradient[t] = k1
+        points[t + 1] = state
 
-        x += dx * DT
-        y += dy * DT
-        z += dz * DT
-
-        points[t + 1] = (x, y, z)
-
-    gradient[steps] = (PRANDTL * (y - x) + u, x * (RAYLEIGH - z) - y, x * y - B * z)
+    gradient[steps] = lorenz(state, u)
 
     return points, gradient
 
@@ -56,15 +92,7 @@ def tensor_data(initial_x, initial_y, initial_z, control, steps=TIMESTEPS):
     points = [state]
 
     for _ in range(steps):
-        x, y, z = state
-
-        ut = control(state) if callable(control) else control
-
-        dx = PRANDTL * (y - x) + ut
-        dy = x * (RAYLEIGH - z) - y
-        dz = x * y - B * z
-
-        state = state + torch.stack((dx, dy, dz)) * DT
+        state, _ = STEP(state, control)
 
         points.append(state)
 
