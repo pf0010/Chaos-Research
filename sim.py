@@ -9,7 +9,7 @@ DT = 0.01
 LYAPUNOV_EXP = 0.9056
 EPS = 2.0
 U_REF = 60.0
-LAMBDA = 0.007
+LAMBDA = 0.07
 
 
 def lorenz(state, u=0.0):
@@ -52,7 +52,7 @@ def rk4_step(state, control, dt=DT):
     return state + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4), k1
 
 
-STEP = rk4_step
+STEP = euler_step
 
 
 def array_data(initial_x, initial_y, initial_z, steps=TIMESTEPS, u=0.0):

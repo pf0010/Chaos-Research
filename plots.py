@@ -208,6 +208,7 @@ def control_plots(
     iters=600,
     regularized=False,
     save=False,
+    lam=LAMBDA
 ):
     params = optimize_gradient(
         ic=ic,
@@ -215,12 +216,13 @@ def control_plots(
         lyapunov_times=train_lyapunov_times,
         iters=iters,
         regularized=regularized,
+        lam=lam
     )
 
     steps = round(plot_lyapunov_times / (LYAPUNOV_EXP * DT))
 
     if save:
-        path = f"./plots/control/"
+        path = f"./plots/control/lambda_{lam}/"
         filename = f"{train_lyapunov_times}"
 
         if regularized:
@@ -250,6 +252,7 @@ if __name__ == "__main__":
     parser.add_argument("-l2", "--l2_regularized", action="store_true")
     parser.add_argument("-gg", "--gradient_growth", type=float, default=0)
     parser.add_argument("-s", "--save", action="store_true")
+    parser.add_argument("-lam", "--tuning_rate", type=float, default=0.07)
     args = parser.parse_args()
 
     if args.gradient_growth:
@@ -263,4 +266,5 @@ if __name__ == "__main__":
             iters=args.iters,
             regularized=args.l2_regularized,
             save=args.save,
+            lam=args.tuning_rate
         )
