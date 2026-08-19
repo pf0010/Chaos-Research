@@ -134,6 +134,7 @@ def control_plots(
     regularized=False,
     save=False,
     lam=LAMBDA,
+    integrator=euler_step
 ):
     params = optimize_gradient(
         ic=ic,
@@ -142,6 +143,7 @@ def control_plots(
         iters=iters,
         regularized=regularized,
         lam=lam,
+        integrator=integrator
     )
 
     steps = round(plot_lyapunov_times / (LYAPUNOV_EXP * DT))
@@ -178,6 +180,7 @@ if __name__ == "__main__":
     parser.add_argument("-gg", "--gradient_growth", type=float, default=0)
     parser.add_argument("-s", "--save", action="store_true")
     parser.add_argument("-lam", "--tuning_rate", type=float, default=0.07)
+    parser.add_argument("-rk4", "--rk4", action="store_true")
     args = parser.parse_args()
 
     if args.gradient_growth:
@@ -192,4 +195,5 @@ if __name__ == "__main__":
             regularized=args.l2_regularized,
             save=args.save,
             lam=args.tuning_rate,
+            integrator=rk4_step if args.rk4 else euler_step
         )

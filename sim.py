@@ -52,10 +52,9 @@ def rk4_step(state, control, dt=DT):
     return state + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4), k1
 
 
-STEP = euler_step
-
-
-def array_data(initial_x, initial_y, initial_z, steps=TIMESTEPS, u=0.0):
+def array_data(
+    initial_x, initial_y, initial_z, steps=TIMESTEPS, u=0.0, integrator=euler_step
+):
     state = np.array((initial_x, initial_y, initial_z), dtype=float)
 
     points = np.empty((steps + 1, 3))
@@ -64,7 +63,7 @@ def array_data(initial_x, initial_y, initial_z, steps=TIMESTEPS, u=0.0):
     gradient = np.empty((steps + 1, 3))
 
     for t in range(steps):
-        state, k1 = STEP(state, u)
+        state, k1 = integrator(state, u)
 
         gradient[t] = k1
         points[t + 1] = state
@@ -86,13 +85,15 @@ def control_force(state, params):
     return torch.dot(w, state) + b
 
 
-def tensor_data(initial_x, initial_y, initial_z, control, steps=TIMESTEPS):
+def tensor_data(
+    initial_x, initial_y, initial_z, control, steps=TIMESTEPS, integrator=euler_step
+):
     state = torch.tensor([initial_x, initial_y, initial_z], dtype=torch.float64)
 
     points = [state]
 
     for _ in range(steps):
-        state, _ = STEP(state, control)
+        state, _ = integrator(state, control)
 
         points.append(state)
 
@@ -137,6 +138,7 @@ def optimize_gradient(
     lr=0.1,
     lam=LAMBDA,
     regularized=False,
+    integrator=euler_step,
 ):
     steps = round(lyapunov_times / (LYAPUNOV_EXP * DT))
 
@@ -147,7 +149,9 @@ def optimize_gradient(
 
     for i in range(iters):
         opt.zero_grad()
-        traj = tensor_data(*ic, lambda s: control_force(s, params), steps=steps)
+        traj = tensor_data(
+            *ic, lambda s: control_force(s, params), steps=steps, integrator=integrator
+        )
         task = calculate_loss(traj)
         effort = control_effort(traj, params)
 
