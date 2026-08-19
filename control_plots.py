@@ -24,9 +24,7 @@ def add_caption(fig, caption):
         fig.text(0.5, 0.01, caption, ha="center", fontsize=8, color="gray")
 
 
-def control_trajectory(
-    params, initial=(0, 1, 1.05), steps=300, integrator=euler_step
-):
+def control_trajectory(params, initial=(0, 1, 1.05), steps=300, integrator=euler_step):
     traj = tensor_data(
         *initial,
         lambda s: control_force(s, params),
@@ -219,9 +217,7 @@ def control_plots(
         rk4="on" if integrator is rk4_step else "off",
     )
 
-    pts, us = control_trajectory(
-        params, initial=ic, steps=steps, integrator=integrator
-    )
+    pts, us = control_trajectory(params, initial=ic, steps=steps, integrator=integrator)
 
     fig = plt.figure(figsize=(15, 7))
     gs = fig.add_gridspec(2, 2, width_ratios=(1.1, 1))
@@ -267,10 +263,11 @@ if __name__ == "__main__":
     parser.add_argument("-i", "--iters", type=int, default=600)
     parser.add_argument("-lam", "--tuning_rate", type=float, default=0.07)
     parser.add_argument("-gg", "--gradient_growth", type=float, default=0)
-    parser.add_argument("-s", "--save", action="store_true")
 
-    parser.add_argument("-l2", "--l2_regularized", action="store_true")
-    parser.add_argument("-rk4", "--rk4", action="store_true")
+    flags = parser.add_argument_group(title="Flags")
+    flags.add_argument("-s", "--save", action="store_true")
+    flags.add_argument("-l2", "--l2_regularized", action="store_true")
+    flags.add_argument("-rk4", "--rk4", action="store_true")
     args = parser.parse_args()
 
     if args.gradient_growth:
