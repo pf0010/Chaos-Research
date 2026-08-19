@@ -2,6 +2,7 @@ from sim import *
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d.art3d import Line3DCollection
 import argparse
+import os
 
 
 def controller_actions(points, params):
@@ -23,26 +24,34 @@ def add_caption(fig, caption):
         fig.text(0.5, 0.01, caption, ha="center", fontsize=8, color="gray")
 
 
-def plot_control(
-    params,
-    initial=(0, 1, 1.05),
-    steps=300,
-    regularized=False,
-    caption=None,
-    integrator=euler_step,
+def control_trajectory(
+    params, initial=(0, 1, 1.05), steps=300, integrator=euler_step
 ):
-    # COLORS = ("green", "orange", "black")
     traj = tensor_data(
         *initial,
         lambda s: control_force(s, params),
         steps=steps,
         integrator=integrator,
     )
-    pts = traj.detach().numpy()
-    us = controller_actions(traj, params)
+    return traj.detach().numpy(), controller_actions(traj, params)
+
+
+def plot_control(
+    pts,
+    us,
+    regularized=False,
+    caption=None,
+    axes=None,
+):
+    # COLORS = ("green", "orange", "black")
     lyapunov_times = np.arange(len(pts)) * DT * LYAPUNOV_EXP
 
-    fig, (ax_traj, ax_u) = plt.subplots(2, 1, sharex=True, figsize=(10, 7))
+    own_figure = axes is None
+
+    if own_figure:
+        _, axes = plt.subplots(2, 1, sharex=True, figsize=(10, 7))
+
+    ax_traj, ax_u = axes
 
     ax_traj.axhline(0, color="black", linestyle="--", linewidth=1)
     for i, label in enumerate("xyz"):
@@ -63,28 +72,24 @@ def plot_control(
     ax_u.set_xlabel("Lyapunov times (t / τ)")
     ax_u.set_title("Controller action")
 
-    fig.tight_layout(rect=(0, 0.03, 1, 1) if caption else None)
-    add_caption(fig, caption)
+    if own_figure:
+        fig = ax_traj.figure
+        fig.tight_layout(rect=(0, 0.03, 1, 1) if caption else None)
+        add_caption(fig, caption)
 
 
 def plot_control_attractor(
-    params,
-    initial=(0, 1, 1.05),
-    steps=300,
+    pts,
+    us,
     regularized=False,
     caption=None,
-    integrator=euler_step,
+    ax=None,
 ):
-    traj = tensor_data(
-        *initial,
-        lambda s: control_force(s, params),
-        steps=steps,
-        integrator=integrator,
-    )
-    pts = traj.detach().numpy()
-    us = controller_actions(traj, params)
+    own_figure = ax is None
 
-    ax = plt.figure(figsize=(11, 7)).add_subplot(projection="3d")
+    if own_figure:
+        ax = plt.figure(figsize=(11, 7)).add_subplot(projection="3d")
+
     ax.set_xlabel("X Axis")
     ax.set_ylabel("Y Axis")
     ax.set_zlabel("Z Axis")
@@ -104,7 +109,8 @@ def plot_control_attractor(
 
     ax.figure.colorbar(lc, ax=ax, shrink=0.6, pad=0.11, label="control u")
 
-    add_caption(ax.figure, caption)
+    if own_figure:
+        add_caption(ax.figure, caption)
 
 
 def plot_gradient_growth(
@@ -213,6 +219,22 @@ def control_plots(
         rk4="on" if integrator is rk4_step else "off",
     )
 
+    pts, us = control_trajectory(
+        params, initial=ic, steps=steps, integrator=integrator
+    )
+
+    fig = plt.figure(figsize=(15, 7))
+    gs = fig.add_gridspec(2, 2, width_ratios=(1.1, 1))
+    ax_attractor = fig.add_subplot(gs[:, 0], projection="3d")
+    ax_traj = fig.add_subplot(gs[0, 1])
+    ax_u = fig.add_subplot(gs[1, 1], sharex=ax_traj)
+
+    plot_control(pts, us, regularized=regularized, axes=(ax_traj, ax_u))
+    plot_control_attractor(pts, us, regularized=regularized, ax=ax_attractor)
+
+    fig.tight_layout(rect=(0, 0.03, 1, 1) if caption else None)
+    add_caption(fig, caption)
+
     if save:
         path = f"./plots/control/lambda_{lam}/"
         filename = f"{train_lyapunov_times}"
@@ -222,57 +244,32 @@ def control_plots(
         else:
             filename += "_unregularized"
 
-        plot_control(
-            params,
-            initial=ic,
-            steps=steps,
-            regularized=regularized,
-            caption=caption,
-            integrator=integrator,
-        )
-        plt.savefig(path + filename + "_traj.png", dpi=150, bbox_inches="tight")
-        plot_control_attractor(
-            params,
-            initial=ic,
-            steps=steps,
-            regularized=regularized,
-            caption=caption,
-            integrator=integrator,
-        )
-        plt.savefig(path + filename + "_attractor.png", dpi=150, bbox_inches="tight")
+        os.makedirs(path, exist_ok=True)
+        plt.savefig(path + filename + ".png", dpi=150, bbox_inches="tight")
+        print(f"Saved to {path + filename}.png")
     else:
-        plot_control(
-            params,
-            initial=ic,
-            steps=steps,
-            regularized=regularized,
-            caption=caption,
-            integrator=integrator,
-        )
-        plot_control_attractor(
-            params,
-            initial=ic,
-            steps=steps,
-            regularized=regularized,
-            caption=caption,
-            integrator=integrator,
-        )
         plt.show()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "-ic", "--initial_condition", nargs=3, type=float, default=[0, 1, 1.05]
+        "-ic",
+        "--initial_condition",
+        nargs=3,
+        type=float,
+        default=[0, 1, 1.05],
+        metavar=("X", "Y", "Z"),
     )
     parser.add_argument("-lr", "--learning_rate", type=float, default=0.05)
     parser.add_argument("-tlt", "--train_lyapunov_times", type=float, default=1)
     parser.add_argument("-plt", "--plot_lyapunov_times", type=float, default=100)
     parser.add_argument("-i", "--iters", type=int, default=600)
-    parser.add_argument("-l2", "--l2_regularized", action="store_true")
+    parser.add_argument("-lam", "--tuning_rate", type=float, default=0.07)
     parser.add_argument("-gg", "--gradient_growth", type=float, default=0)
     parser.add_argument("-s", "--save", action="store_true")
-    parser.add_argument("-lam", "--tuning_rate", type=float, default=0.07)
+
+    parser.add_argument("-l2", "--l2_regularized", action="store_true")
     parser.add_argument("-rk4", "--rk4", action="store_true")
     args = parser.parse_args()
 
