@@ -14,9 +14,30 @@ def controller_actions(points, params):
     return (pts.detach().to(torch.float64) @ w.detach() + b.detach()).numpy()
 
 
-def plot_control(params, initial=(0, 1, 1.05), steps=300, regularized=False):
+def settings_caption(**settings):
+    return "   ".join(f"{key}={value}" for key, value in settings.items())
+
+
+def add_caption(fig, caption):
+    if caption:
+        fig.text(0.5, 0.01, caption, ha="center", fontsize=8, color="gray")
+
+
+def plot_control(
+    params,
+    initial=(0, 1, 1.05),
+    steps=300,
+    regularized=False,
+    caption=None,
+    integrator=euler_step,
+):
     # COLORS = ("green", "orange", "black")
-    traj = tensor_data(*initial, lambda s: control_force(s, params), steps=steps)
+    traj = tensor_data(
+        *initial,
+        lambda s: control_force(s, params),
+        steps=steps,
+        integrator=integrator,
+    )
     pts = traj.detach().numpy()
     us = controller_actions(traj, params)
     lyapunov_times = np.arange(len(pts)) * DT * LYAPUNOV_EXP
@@ -42,11 +63,24 @@ def plot_control(params, initial=(0, 1, 1.05), steps=300, regularized=False):
     ax_u.set_xlabel("Lyapunov times (t / τ)")
     ax_u.set_title("Controller action")
 
-    fig.tight_layout()
+    fig.tight_layout(rect=(0, 0.03, 1, 1) if caption else None)
+    add_caption(fig, caption)
 
 
-def plot_control_attractor(params, initial=(0, 1, 1.05), steps=300, regularized=False):
-    traj = tensor_data(*initial, lambda s: control_force(s, params), steps=steps)
+def plot_control_attractor(
+    params,
+    initial=(0, 1, 1.05),
+    steps=300,
+    regularized=False,
+    caption=None,
+    integrator=euler_step,
+):
+    traj = tensor_data(
+        *initial,
+        lambda s: control_force(s, params),
+        steps=steps,
+        integrator=integrator,
+    )
     pts = traj.detach().numpy()
     us = controller_actions(traj, params)
 
@@ -69,6 +103,8 @@ def plot_control_attractor(params, initial=(0, 1, 1.05), steps=300, regularized=
     ax.auto_scale_xyz(pts[:, 0], pts[:, 1], pts[:, 2])
 
     ax.figure.colorbar(lc, ax=ax, shrink=0.6, pad=0.11, label="control u")
+
+    add_caption(ax.figure, caption)
 
 
 def plot_gradient_growth(
@@ -100,13 +136,20 @@ def plot_gradient_growth(
     plt.show()
 
 
-def plot_gradient_vs_window(ic=(0, 1, 1.05), max_lt=8.0, n=50, save=False):
+def plot_gradient_vs_window(
+    ic=(0, 1, 1.05), max_lt=8.0, n=50, save=False, integrator=euler_step
+):
     windows = np.linspace(0.1, max_lt, n)
     norms = []
     for lt in windows:
         params = create_controller()
         steps = round(lt / (LYAPUNOV_EXP * DT))
-        traj = tensor_data(*ic, lambda s: control_force(s, params), steps=steps)
+        traj = tensor_data(
+            *ic,
+            lambda s: control_force(s, params),
+            steps=steps,
+            integrator=integrator,
+        )
         g = torch.autograd.grad(calculate_loss(traj), params)
         norms.append(torch.cat([gi.reshape(-1) for gi in g]).norm().item())
 
@@ -115,6 +158,17 @@ def plot_gradient_vs_window(ic=(0, 1, 1.05), max_lt=8.0, n=50, save=False):
     ax.set_xlabel("Lyapunov times (t / τ)")
     ax.set_ylabel("Loss-gradient")
     ax.set_title("Loss-gradient blowup vs. training window")
+
+    ax.figure.tight_layout(rect=(0, 0.06, 1, 1))
+    add_caption(
+        ax.figure,
+        settings_caption(
+            ic=f"({','.join(str(v) for v in ic)})",
+            gg=max_lt,
+            n=n,
+            rk4="on" if integrator is rk4_step else "off",
+        ),
+    )
 
     if save:
         plt.savefig(
@@ -134,7 +188,7 @@ def control_plots(
     regularized=False,
     save=False,
     lam=LAMBDA,
-    integrator=euler_step
+    integrator=euler_step,
 ):
     params = optimize_gradient(
         ic=ic,
@@ -143,10 +197,21 @@ def control_plots(
         iters=iters,
         regularized=regularized,
         lam=lam,
-        integrator=integrator
+        integrator=integrator,
     )
 
     steps = round(plot_lyapunov_times / (LYAPUNOV_EXP * DT))
+
+    caption = settings_caption(
+        ic=f"({','.join(str(v) for v in ic)})",
+        lr=lr,
+        tlt=train_lyapunov_times,
+        plt=plot_lyapunov_times,
+        iters=iters,
+        lam=lam,
+        l2="on" if regularized else "off",
+        rk4="on" if integrator is rk4_step else "off",
+    )
 
     if save:
         path = f"./plots/control/lambda_{lam}/"
@@ -157,13 +222,41 @@ def control_plots(
         else:
             filename += "_unregularized"
 
-        plot_control(params, steps=steps, regularized=regularized)
+        plot_control(
+            params,
+            initial=ic,
+            steps=steps,
+            regularized=regularized,
+            caption=caption,
+            integrator=integrator,
+        )
         plt.savefig(path + filename + "_traj.png", dpi=150, bbox_inches="tight")
-        plot_control_attractor(params, steps=steps, regularized=regularized)
+        plot_control_attractor(
+            params,
+            initial=ic,
+            steps=steps,
+            regularized=regularized,
+            caption=caption,
+            integrator=integrator,
+        )
         plt.savefig(path + filename + "_attractor.png", dpi=150, bbox_inches="tight")
     else:
-        plot_control(params, steps=steps, regularized=regularized)
-        plot_control_attractor(params, steps=steps, regularized=regularized)
+        plot_control(
+            params,
+            initial=ic,
+            steps=steps,
+            regularized=regularized,
+            caption=caption,
+            integrator=integrator,
+        )
+        plot_control_attractor(
+            params,
+            initial=ic,
+            steps=steps,
+            regularized=regularized,
+            caption=caption,
+            integrator=integrator,
+        )
         plt.show()
 
 
@@ -184,7 +277,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.gradient_growth:
-        plot_gradient_vs_window(ic=args.initial_condition, max_lt=args.gradient_growth)
+        plot_gradient_vs_window(
+            ic=args.initial_condition,
+            max_lt=args.gradient_growth,
+            integrator=rk4_step if args.rk4 else euler_step,
+        )
     else:
         control_plots(
             ic=args.initial_condition,
@@ -195,5 +292,5 @@ if __name__ == "__main__":
             regularized=args.l2_regularized,
             save=args.save,
             lam=args.tuning_rate,
-            integrator=rk4_step if args.rk4 else euler_step
+            integrator=rk4_step if args.rk4 else euler_step,
         )
