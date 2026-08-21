@@ -170,6 +170,7 @@ def plot_gradient_vs_window(
             ic=f"({','.join(str(v) for v in ic)})",
             gg=max_lt,
             n=n,
+            dt=DT,
             rk4="on" if integrator is rk4_step else "off",
         ),
     )
@@ -213,6 +214,7 @@ def control_plots(
         plt=plot_lyapunov_times,
         iters=iters,
         lam=lam,
+        dt=DT,
         l2="on" if regularized else "off",
         rk4="on" if integrator is rk4_step else "off",
     )
@@ -232,13 +234,16 @@ def control_plots(
     add_caption(fig, caption)
 
     if save:
-        path = f"./plots/control/lambda_{lam}/"
-        filename = f"{train_lyapunov_times}"
+        path = f"./plots/control/lambda_sweep/"
+        filename = f"lambda{lam}_{train_lyapunov_times}"
 
         if regularized:
             filename += "_regularized"
         else:
             filename += "_unregularized"
+
+        if integrator == rk4_step:
+            filename += "_rk4"
 
         os.makedirs(path, exist_ok=True)
         plt.savefig(path + filename + ".png", dpi=150, bbox_inches="tight")
