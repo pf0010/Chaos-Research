@@ -1,0 +1,158 @@
+"""Sweep control_plots.py over a grid of lambda and train_lyapunov_time values.
+
+Each grid point runs as its own control_plots.py subprocess, so the sweep is
+parallelized simply by running several of them at once.
+
+    python sweep.py                 # full grid, one worker per core
+    python sweep.py -j 4            # cap at 4 concurrent runs
+    python sweep.py --dry-run       # print the commands without running them
+"""
+
+import argparse
+import os
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "control_plots.py")
+
+
+def frange(start, stop, step):
+    # inclusive of stop, with a tolerance so 0.15 isn't dropped by float error
+    values = []
+    n = 0
+    while True:
+        value = round(start + n * step, 6)
+        if value > stop + step / 2:
+            break
+        values.append(value)
+        n += 1
+    return values
+
+
+def build_command(lam, tlt, args):
+    cmd = [
+        sys.executable,
+        SCRIPT,
+        "-lam",
+        str(lam),
+        "-tlt",
+        str(tlt),
+        "-lr",
+        str(args.learning_rate),
+        "-plt",
+        str(args.plot_lyapunov_times),
+        "-i",
+        str(args.iters),
+        "-ic",
+        *(str(v) for v in args.initial_condition),
+        "-s",
+    ]
+
+    # no -rk4: every run integrates with euler_step
+    if not args.unregularized:
+        cmd.append("-l2")
+    if args.rk4:
+        cmd.append("-rk4")
+
+    return cmd
+
+
+def run(cmd, env):
+    start = time.monotonic()
+    proc = subprocess.run(cmd, env=env, capture_output=True, text=True)
+    return proc, time.monotonic() - start
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--lam_start", type=float, default=0.05)
+    parser.add_argument("--lam_stop", type=float, default=0.15)
+    parser.add_argument("--lam_step", type=float, default=0.01)
+    parser.add_argument("--tlt_start", type=float, default=1.0)
+    parser.add_argument("--tlt_stop", type=float, default=2.0)
+    parser.add_argument("--tlt_step", type=float, default=0.25)
+
+    parser.add_argument(
+        "-j",
+        "--jobs",
+        type=int,
+        default=os.cpu_count(),
+        help="max concurrent control_plots.py runs (default: all cores)",
+    )
+
+    # passed straight through to control_plots.py
+    parser.add_argument(
+        "-ic",
+        "--initial_condition",
+        nargs=3,
+        type=float,
+        default=[0, 1, 1.05],
+        metavar=("X", "Y", "Z"),
+    )
+    parser.add_argument("-lr", "--learning_rate", type=float, default=0.05)
+    parser.add_argument("-plt", "--plot_lyapunov_times", type=float, default=100)
+    parser.add_argument("-i", "--iters", type=int, default=600)
+
+    flags = parser.add_argument_group(title="Flags")
+    flags.add_argument("-rk4", "--rk4", action="store_true")
+    flags.add_argument(
+        "-u",
+        "--unregularized",
+        action="store_true",
+        help="drop -l2; lambda then has no effect on training",
+    )
+    flags.add_argument("--dry_run", "--dry-run", action="store_true", dest="dry_run")
+    args = parser.parse_args()
+
+    lams = frange(args.lam_start, args.lam_stop, args.lam_step)
+    tlts = frange(args.tlt_start, args.tlt_stop, args.tlt_step)
+    grid = [(lam, tlt) for lam in lams for tlt in tlts]
+
+    print(f"lambda: {lams}")
+    print(f"tlt:    {tlts}")
+    print(f"{len(grid)} runs, {args.jobs} at a time")
+
+    if args.dry_run:
+        for lam, tlt in grid:
+            print(" ".join(build_command(lam, tlt, args)))
+        sys.exit(0)
+
+    # each run is single-threaded so the workers don't oversubscribe the CPU,
+    # and Agg keeps matplotlib from reaching for a GUI backend
+    env = {
+        **os.environ,
+        "MPLBACKEND": "Agg",
+        "OMP_NUM_THREADS": "1",
+        "MKL_NUM_THREADS": "1",
+    }
+
+    failures = []
+    started = time.monotonic()
+
+    with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+        futures = {
+            pool.submit(run, build_command(lam, tlt, args), env): (lam, tlt)
+            for lam, tlt in grid
+        }
+
+        for done, future in enumerate(as_completed(futures), start=1):
+            lam, tlt = futures[future]
+            proc, elapsed = future.result()
+            status = "ok " if proc.returncode == 0 else "FAIL"
+
+            print(
+                f"[{done}/{len(grid)}] {status} lam={lam} tlt={tlt}  {elapsed:.1f}s",
+                flush=True,
+            )
+
+            if proc.returncode != 0:
+                failures.append((lam, tlt, proc.stderr.strip()))
+
+    print(f"\nfinished in {time.monotonic() - started:.1f}s")
+
+    for lam, tlt, stderr in failures:
+        print(f"\nlam={lam} tlt={tlt} failed:\n{stderr}")
+
+    sys.exit(1 if failures else 0)
