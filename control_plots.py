@@ -262,7 +262,8 @@ def control_plots(
     pts, us = control_trajectory(params, initial=ic, steps=steps, integrator=integrator)
 
     success = success_fraction(pts)
-    print(f"success (fraction of time x > 0): {success:.4f}")
+    # sweep.py scrapes this line, so keep the prefix stable
+    print(f"success (fraction of time x > 0): {success:.6f}")
 
     caption = settings_caption(
         ic=f"({','.join(str(v) for v in ic)})",

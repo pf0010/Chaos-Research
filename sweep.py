@@ -7,16 +7,21 @@ parallelized simply by running several of them at once.
     python sweep.py -j 4            # cap at 4 concurrent runs
     python sweep.py -loss           # also save a loss-vs-iteration plot per point
     python sweep.py --dry-run       # print the commands without running them
+
+Every run also writes the success rate of each grid point to --csv.
 """
 
 import argparse
+import csv
 import os
+import re
 import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "control_plots.py")
+SUCCESS_RE = re.compile(r"success \(fraction of time x > 0\): ([0-9.]+)")
 
 
 def frange(start, stop, step):
@@ -67,6 +72,38 @@ def run(cmd, env):
     return proc, time.monotonic() - start
 
 
+def parse_success(stdout):
+    match = SUCCESS_RE.search(stdout)
+
+    return float(match.group(1)) if match else None
+
+
+def write_csv(path, rows, args):
+    # the run settings are constant across the grid, but carrying them along
+    # keeps a csv self-describing once it's been moved away from the sweep
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["lam", "tlt", "success", "lr", "iters", "plt", "l2", "rk4"])
+
+        for lam, tlt, success in sorted(rows):
+            writer.writerow(
+                [
+                    lam,
+                    tlt,
+                    "" if success is None else f"{success:.6f}",
+                    args.learning_rate,
+                    args.iters,
+                    args.plot_lyapunov_times,
+                    int(not args.unregularized),
+                    int(args.rk4),
+                ]
+            )
+
+    print(f"wrote {len(rows)} rows to {path}")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--lam_start", type=float, default=0.05)
@@ -96,6 +133,12 @@ if __name__ == "__main__":
     parser.add_argument("-lr", "--learning_rate", type=float, default=0.05)
     parser.add_argument("-plt", "--plot_lyapunov_times", type=float, default=100)
     parser.add_argument("-i", "--iters", type=int, default=600)
+
+    parser.add_argument(
+        "--csv",
+        default="./plots/loss_sweep/success.csv",
+        help="where to write the success rates (default: %(default)s)",
+    )
 
     flags = parser.add_argument_group(title="Flags")
     flags.add_argument("-rk4", "--rk4", action="store_true")
@@ -137,6 +180,7 @@ if __name__ == "__main__":
     }
 
     failures = []
+    rows = []
     started = time.monotonic()
 
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
@@ -149,9 +193,12 @@ if __name__ == "__main__":
             lam, tlt = futures[future]
             proc, elapsed = future.result()
             status = "ok " if proc.returncode == 0 else "FAIL"
+            success = parse_success(proc.stdout) if proc.returncode == 0 else None
+            rows.append((lam, tlt, success))
 
             print(
-                f"[{done}/{len(grid)}] {status} lam={lam} tlt={tlt}  {elapsed:.1f}s",
+                f"[{done}/{len(grid)}] {status} lam={lam} tlt={tlt}  {elapsed:.1f}s"
+                f"  success={'--' if success is None else f'{success:.4f}'}",
                 flush=True,
             )
 
@@ -159,6 +206,12 @@ if __name__ == "__main__":
                 failures.append((lam, tlt, proc.stderr.strip()))
 
     print(f"\nfinished in {time.monotonic() - started:.1f}s")
+
+    write_csv(args.csv, rows, args)
+
+    missing = [(lam, tlt) for lam, tlt, s in rows if s is None]
+    if missing:
+        print(f"{len(missing)} of {len(rows)} runs reported no success rate")
 
     for lam, tlt, stderr in failures:
         print(f"\nlam={lam} tlt={tlt} failed:\n{stderr}")
