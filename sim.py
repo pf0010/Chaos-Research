@@ -121,6 +121,17 @@ def calculate_loss(p, eps=EPS):
     return (1 - phi(x, eps)).mean()
 
 
+def success_fraction(p):
+    # hard counterpart of calculate_loss: no tanh softening, so this is the
+    # metric we actually care about rather than the one we differentiate
+    x = p[:, 0]
+
+    if isinstance(x, torch.Tensor):
+        return (x > 0).to(torch.float64).mean().item()
+
+    return float((x > 0).mean())
+
+
 def control_effort(p, params, u_ref=U_REF):
     w, b = params
 

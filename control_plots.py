@@ -259,6 +259,11 @@ def control_plots(
 ):
     steps = round(plot_lyapunov_times / (LYAPUNOV_EXP * DT))
 
+    pts, us = control_trajectory(params, initial=ic, steps=steps, integrator=integrator)
+
+    success = success_fraction(pts)
+    print(f"success (fraction of time x > 0): {success:.4f}")
+
     caption = settings_caption(
         ic=f"({','.join(str(v) for v in ic)})",
         lr=lr,
@@ -269,9 +274,8 @@ def control_plots(
         dt=DT,
         l2="on" if regularized else "off",
         rk4="on" if integrator is rk4_step else "off",
+        success=f"{success:.3f}",
     )
-
-    pts, us = control_trajectory(params, initial=ic, steps=steps, integrator=integrator)
 
     fig = plt.figure(figsize=(15, 7))
     gs = fig.add_gridspec(2, 2, width_ratios=(1.1, 1))
