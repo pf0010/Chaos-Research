@@ -139,7 +139,10 @@ def optimize_gradient(
     lam=LAMBDA,
     regularized=False,
     integrator=euler_step,
+    history=None,
+    verbose=True,
 ):
+    # history, if given, is a list that collects (task, penalty, total) per iter
     steps = round(lyapunov_times / (LYAPUNOV_EXP * DT))
 
     if params is None:
@@ -162,7 +165,10 @@ def optimize_gradient(
         loss.backward()
         opt.step()
 
-        if i % 20 == 0:
+        if history is not None:
+            history.append((task.item(), lam * effort.item(), loss.item()))
+
+        if verbose and i % 20 == 0:
             w, b = params
             rms = U_REF * effort.item() ** 0.5
             print(

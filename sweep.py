@@ -5,6 +5,7 @@ parallelized simply by running several of them at once.
 
     python sweep.py                 # full grid, one worker per core
     python sweep.py -j 4            # cap at 4 concurrent runs
+    python sweep.py -loss           # also save a loss-vs-iteration plot per point
     python sweep.py --dry-run       # print the commands without running them
 """
 
@@ -50,11 +51,12 @@ def build_command(lam, tlt, args):
         "-s",
     ]
 
-    # no -rk4: every run integrates with euler_step
     if not args.unregularized:
         cmd.append("-l2")
     if args.rk4:
         cmd.append("-rk4")
+    if args.loss_curve:
+        cmd.append("-loss")
 
     return cmd
 
@@ -97,6 +99,12 @@ if __name__ == "__main__":
 
     flags = parser.add_argument_group(title="Flags")
     flags.add_argument("-rk4", "--rk4", action="store_true")
+    flags.add_argument(
+        "-loss",
+        "--loss_curve",
+        action="store_true",
+        help="also save a loss-vs-iteration plot for every grid point",
+    )
     flags.add_argument(
         "-u",
         "--unregularized",

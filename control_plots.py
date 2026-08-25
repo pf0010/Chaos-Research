@@ -184,7 +184,69 @@ def plot_gradient_vs_window(
         plt.show()
 
 
+def plot_loss_curve(
+    history,
+    ic=[0, 1, 1.05],
+    lr=0.05,
+    train_lyapunov_times=1.0,
+    iters=600,
+    regularized=False,
+    lam=LAMBDA,
+    integrator=euler_step,
+    save=False,
+):
+    task, penalty, total = np.asarray(history).T
+    iterations = np.arange(len(total))
+
+    ax = plt.figure(figsize=(9, 6)).add_subplot()
+    ax.plot(iterations, total, color="crimson", linewidth=1.0, label="total loss")
+
+    # if regularized:
+    #     ax.plot(iterations, task, color="tab:blue", linewidth=0.8, label="task")
+    #     ax.plot(
+    #         iterations, penalty, color="gray", linewidth=0.8, label=f"λ·effort"
+    #     )
+
+    ax.set_xlabel("iteration")
+    ax.set_ylabel("loss")
+    ax.set_title("Training loss vs. iteration")
+    ax.legend(loc="upper right")
+
+    print(f"loss: {total[0]:.4f} -> {total[-1]:.4f}   min {total.min():.4f}")
+
+    caption = settings_caption(
+        ic=f"({','.join(str(v) for v in ic)})",
+        lr=lr,
+        tlt=train_lyapunov_times,
+        iters=iters,
+        lam=lam,
+        dt=DT,
+        l2="on" if regularized else "off",
+        rk4="on" if integrator is rk4_step else "off",
+    )
+
+    ax.figure.tight_layout(rect=(0, 0.04, 1, 1))
+    add_caption(ax.figure, caption)
+
+    if save:
+        path = "./plots/loss_sweep/loss_v_iteration/"
+        # same stem as the attractor plots so the two directories line up
+        filename = f"lambda{lam}_{train_lyapunov_times}"
+        filename += "_regularized" if regularized else "_unregularized"
+
+        if integrator is rk4_step:
+            filename += "_rk4"
+
+        filename += "_loss"
+        os.makedirs(path, exist_ok=True)
+        plt.savefig(path + filename + ".png", dpi=150, bbox_inches="tight")
+        print(f"Saved to {path + filename}.png")
+    else:
+        plt.show()
+
+
 def control_plots(
+    params,
     ic=[0, 1, 1.05],
     lr=0.05,
     train_lyapunov_times=1.0,
@@ -195,16 +257,6 @@ def control_plots(
     lam=LAMBDA,
     integrator=euler_step,
 ):
-    params = optimize_gradient(
-        ic=ic,
-        lr=lr,
-        lyapunov_times=train_lyapunov_times,
-        iters=iters,
-        regularized=regularized,
-        lam=lam,
-        integrator=integrator,
-    )
-
     steps = round(plot_lyapunov_times / (LYAPUNOV_EXP * DT))
 
     caption = settings_caption(
@@ -234,7 +286,7 @@ def control_plots(
     add_caption(fig, caption)
 
     if save:
-        path = f"./plots/control/lambda_sweep/"
+        path = f"./plots/loss_sweep/attractor/"
         filename = f"lambda{lam}_{train_lyapunov_times}"
 
         if regularized:
@@ -273,6 +325,7 @@ if __name__ == "__main__":
     flags.add_argument("-s", "--save", action="store_true")
     flags.add_argument("-l2", "--l2_regularized", action="store_true")
     flags.add_argument("-rk4", "--rk4", action="store_true")
+    flags.add_argument("-loss", "--loss_curve", action="store_true")
     args = parser.parse_args()
 
     if args.gradient_growth:
@@ -282,7 +335,36 @@ if __name__ == "__main__":
             integrator=rk4_step if args.rk4 else euler_step,
         )
     else:
+        integrator = rk4_step if args.rk4 else euler_step
+
+        # trained once here, then shared by both plots
+        history = []
+        params = optimize_gradient(
+            ic=args.initial_condition,
+            lr=args.learning_rate,
+            lyapunov_times=args.train_lyapunov_times,
+            iters=args.iters,
+            regularized=args.l2_regularized,
+            lam=args.tuning_rate,
+            integrator=integrator,
+            history=history,
+        )
+
+        if args.loss_curve:
+            plot_loss_curve(
+                history,
+                ic=args.initial_condition,
+                lr=args.learning_rate,
+                train_lyapunov_times=args.train_lyapunov_times,
+                iters=args.iters,
+                regularized=args.l2_regularized,
+                lam=args.tuning_rate,
+                integrator=integrator,
+                save=args.save,
+            )
+
         control_plots(
+            params,
             ic=args.initial_condition,
             lr=args.learning_rate,
             train_lyapunov_times=args.train_lyapunov_times,
@@ -291,5 +373,5 @@ if __name__ == "__main__":
             regularized=args.l2_regularized,
             save=args.save,
             lam=args.tuning_rate,
-            integrator=rk4_step if args.rk4 else euler_step,
+            integrator=integrator,
         )
