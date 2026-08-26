@@ -2,6 +2,7 @@ from sim import *
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d.art3d import Line3DCollection
 import argparse
+import csv
 import os
 
 
@@ -229,7 +230,7 @@ def plot_loss_curve(
     add_caption(ax.figure, caption)
 
     if save:
-        path = "./plots/loss_sweep/loss_v_iteration/"
+        path = f"./plots/loss_sweep_{iters}/loss_v_iteration/"
         # same stem as the attractor plots so the two directories line up
         filename = f"lambda{lam}_{train_lyapunov_times}"
         filename += "_regularized" if regularized else "_unregularized"
@@ -241,6 +242,94 @@ def plot_loss_curve(
         os.makedirs(path, exist_ok=True)
         plt.savefig(path + filename + ".png", dpi=150, bbox_inches="tight")
         print(f"Saved to {path + filename}.png")
+        plt.close(ax.figure)
+    else:
+        plt.show()
+
+
+def plot_success_vs_lambda(path="./plots/loss_sweep_1000/success.csv", save=False):
+    """Plot the sweep's success metric against the regularizer strength λ.
+
+    One panel per training window, each shaded by window length. The panels
+    share x and y limits and carry the rest of the sweep behind them in grey,
+    so a panel is readable on its own and still comparable to its neighbours.
+    """
+    with open(path, newline="") as f:
+        rows = [row for row in csv.DictReader(f) if row["success"]]
+
+    if not rows:
+        raise SystemExit(f"no success values in {path}")
+
+    lams = sorted({float(row["lam"]) for row in rows})
+    tlts = sorted({float(row["tlt"]) for row in rows})
+    success = {(float(row["lam"]), float(row["tlt"])): float(row["success"]) for row in rows}
+
+    def line(tlt):
+        xs = [lam for lam in lams if (lam, tlt) in success]
+
+        return xs, [success[(lam, tlt)] for lam in xs]
+
+    norm = plt.Normalize(min(tlts), max(tlts))
+    cmap = plt.colormaps["viridis"]
+
+    cols = min(4, len(tlts))
+    grid_rows = -(-len(tlts) // cols)
+
+    fig, axes = plt.subplots(
+        grid_rows,
+        cols,
+        figsize=(3.6 * cols, 2.9 * grid_rows),
+        sharex=True,
+        sharey=True,
+    )
+    flat = np.atleast_1d(axes).ravel()
+
+    for ax, tlt in zip(flat, tlts):
+        # the other windows in grey give each panel back the context it loses
+
+        ax.plot(*line(tlt), color=cmap(norm(tlt)), linewidth=1.8, marker="o", markersize=4)
+
+        ax.set_title(f"tlt = {tlt}", fontsize=10)
+        ax.set_ylim(-0.03, 1.05)
+        ax.grid(alpha=0.25, linewidth=0.6)
+
+    for ax in flat[len(tlts) :]:
+        ax.set_visible(False)
+
+    # sharex hides tick labels everywhere but the bottom row, so the panels in
+    # a column that the grid leaves short would otherwise lose their x axis
+    for column in range(cols):
+        bottom = [i for i in range(column, len(tlts), cols)]
+        if bottom:
+            flat[bottom[-1]].tick_params(labelbottom=True)
+
+    fig.supxlabel("λ (control-effort penalty)", y=0.03)
+    fig.supylabel("success (fraction of time x > 0)")
+    fig.suptitle("Success vs. regularizer strength, by training window")
+
+    for tlt in tlts:
+        xs, ys = line(tlt)
+        print(f"tlt={tlt}: best success {max(ys):.4f} at lam={xs[ys.index(max(ys))]}")
+
+    settings = rows[0]
+    caption = settings_caption(
+        lr=settings["lr"],
+        iters=settings["iters"],
+        plt=settings["plt"],
+        dt=DT,
+        l2="on" if settings["l2"] == "1" else "off",
+        rk4="on" if settings["rk4"] == "1" else "off",
+        runs=len(rows),
+    )
+
+    fig.tight_layout(rect=(0, 0.055, 1, 1))
+    add_caption(fig, caption)
+
+    if save:
+        out = os.path.join(os.path.dirname(path), "success_v_lambda.png")
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        plt.savefig(out, dpi=150, bbox_inches="tight")
+        print(f"Saved to {out}")
     else:
         plt.show()
 
@@ -256,10 +345,16 @@ def control_plots(
     save=False,
     lam=LAMBDA,
     integrator=euler_step,
+    pts=None,
+    us=None,
 ):
-    steps = round(plot_lyapunov_times / (LYAPUNOV_EXP * DT))
-
-    pts, us = control_trajectory(params, initial=ic, steps=steps, integrator=integrator)
+    # a caller that batched the rollout already holds the trajectory, and
+    # re-integrating it one lambda at a time would undo the point of batching
+    if pts is None:
+        steps = round(plot_lyapunov_times / (LYAPUNOV_EXP * DT))
+        pts, us = control_trajectory(
+            params, initial=ic, steps=steps, integrator=integrator
+        )
 
     success = success_fraction(pts)
     # sweep.py scrapes this line, so keep the prefix stable
@@ -291,7 +386,7 @@ def control_plots(
     add_caption(fig, caption)
 
     if save:
-        path = f"./plots/loss_sweep/attractor/"
+        path = f"./plots/loss_sweep_{iters}/attractor/"
         filename = f"lambda{lam}_{train_lyapunov_times}"
 
         if regularized:
@@ -305,6 +400,8 @@ def control_plots(
         os.makedirs(path, exist_ok=True)
         plt.savefig(path + filename + ".png", dpi=150, bbox_inches="tight")
         print(f"Saved to {path + filename}.png")
+        # a sweep stays in one process, so an unclosed figure per grid point piles up
+        plt.close(fig)
     else:
         plt.show()
 
@@ -325,6 +422,14 @@ if __name__ == "__main__":
     parser.add_argument("-i", "--iters", type=int, default=600)
     parser.add_argument("-lam", "--tuning_rate", type=float, default=0.07)
     parser.add_argument("-gg", "--gradient_growth", type=float, default=0)
+    parser.add_argument(
+        "-sc",
+        "--success_csv",
+        nargs="?",
+        const="./plots/loss_sweep_1000/success.csv",
+        default=None,
+        help="plot success vs lambda from a sweep.py csv instead of training",
+    )
 
     flags = parser.add_argument_group(title="Flags")
     flags.add_argument("-s", "--save", action="store_true")
@@ -333,7 +438,9 @@ if __name__ == "__main__":
     flags.add_argument("-loss", "--loss_curve", action="store_true")
     args = parser.parse_args()
 
-    if args.gradient_growth:
+    if args.success_csv:
+        plot_success_vs_lambda(args.success_csv, save=args.save)
+    elif args.gradient_growth:
         plot_gradient_vs_window(
             ic=args.initial_condition,
             max_lt=args.gradient_growth,
