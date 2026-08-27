@@ -1,14 +1,17 @@
-"""Sweep control_plots.py over a grid of lambda and train_lyapunov_time values.
+"""Sweep run_control.py over a grid of effort_weight and train_horizon values.
 
-Each grid point runs as its own control_plots.py subprocess, so the sweep is
+Each grid point runs as its own run_control.py subprocess, so the sweep is
 parallelized simply by running several of them at once.
 
     python sweep.py                 # full grid, one worker per core
     python sweep.py -j 4            # cap at 4 concurrent runs
     python sweep.py -loss           # also save a loss-vs-iteration plot per point
+    python sweep.py -np             # skip the success-vs-lambda plot at the end
+    python sweep.py -sc             # just plot an existing csv, no grid
     python sweep.py --dry-run       # print the commands without running them
 
-Every run also writes the success rate of each grid point to --csv.
+Every run writes the success rate of each grid point to --csv and then plots
+it; -sc reads that same file back.
 """
 
 import argparse
@@ -20,8 +23,19 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "control_plots.py")
+SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_control.py")
 SUCCESS_RE = re.compile(r"success \(fraction of time x > 0\): ([0-9.]+)")
+
+# one default for both ends of the round trip: what a sweep writes is what
+# -sc and --plot read back
+DEFAULT_CSV = "./plots/loss_sweep/success.csv"
+
+
+def plot_csv(path, save):
+    # imported here so a plain sweep doesn't pay for torch and matplotlib
+    from figures import plot_success_vs_lambda
+
+    plot_success_vs_lambda(path, save=save)
 
 
 def frange(start, stop, step):
@@ -129,10 +143,10 @@ if __name__ == "__main__":
         "--jobs",
         type=int,
         default=os.cpu_count(),
-        help="max concurrent control_plots.py runs (default: all cores)",
+        help="max concurrent run_control.py runs (default: all cores)",
     )
 
-    # passed straight through to control_plots.py
+    # passed straight through to run_control.py
     parser.add_argument(
         "-ic",
         "--initial_condition",
@@ -147,11 +161,26 @@ if __name__ == "__main__":
 
     parser.add_argument(
         "--csv",
-        default="./plots/loss_sweep/success.csv",
+        default=DEFAULT_CSV,
         help="where to write the success rates (default: %(default)s)",
+    )
+    parser.add_argument(
+        "-sc",
+        "--success_csv",
+        nargs="?",
+        const=DEFAULT_CSV,
+        default=None,
+        help="plot success vs lambda from an existing csv instead of sweeping",
     )
 
     flags = parser.add_argument_group(title="Flags")
+    flags.add_argument("-s", "--save", action="store_true")
+    flags.add_argument(
+        "-np",
+        "--no_plot",
+        action="store_true",
+        help="skip the success-vs-lambda plot the grid otherwise saves next to --csv",
+    )
     flags.add_argument("-rk4", "--rk4", action="store_true")
     flags.add_argument(
         "-loss",
@@ -167,6 +196,10 @@ if __name__ == "__main__":
     )
     flags.add_argument("--dry_run", "--dry-run", action="store_true", dest="dry_run")
     args = parser.parse_args()
+
+    if args.success_csv:
+        plot_csv(args.success_csv, save=args.save)
+        sys.exit(0)
 
     lams = frange(args.lam_start, args.lam_stop, args.lam_step)
     train_horizons = frange(args.th_start, args.th_stop, args.th_step)
@@ -220,6 +253,12 @@ if __name__ == "__main__":
     print(f"\nfinished in {time.monotonic() - started:.1f}s")
 
     write_csv(args.csv, rows, args)
+
+    # a finished sweep is usually headless, so write the figure rather than
+    # blocking on a window nobody is watching. an all-failed grid has nothing to
+    # plot, and raising over it would bury the failure report below.
+    if not args.no_plot and any(success is not None for _, _, success in rows):
+        plot_csv(args.csv, save=True)
 
     missing = [(lam, th) for lam, th, s in rows if s is None]
     if missing:

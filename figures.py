@@ -343,7 +343,7 @@ def plot_loss_curve(
         plt.show()
 
 
-def plot_success_vs_lambda(path="./plots/loss_sweep_1000/success.csv", save=False):
+def plot_success_vs_lambda(path, save=False):
     """Plot the sweep's success metric against the regularizer strength λ.
 
     One panel per training window, each shaded by window length. The panels
