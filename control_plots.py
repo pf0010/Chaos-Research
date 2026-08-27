@@ -6,14 +6,12 @@ import csv
 import os
 
 
-def controller_actions(points, params):
+def control_series(params, traj):
     w, b = params
-    pts = (
-        points
-        if isinstance(points, torch.Tensor)
-        else torch.as_tensor(np.asarray(points))
+    states = (
+        traj if isinstance(traj, torch.Tensor) else torch.as_tensor(np.asarray(traj))
     )
-    return (pts.detach().to(torch.float64) @ w.detach() + b.detach()).numpy()
+    return (states.detach().to(torch.float64) @ w.detach() + b.detach()).numpy()
 
 
 def settings_caption(**settings):
@@ -25,25 +23,25 @@ def add_caption(fig, caption):
         fig.text(0.5, 0.01, caption, ha="center", fontsize=8, color="gray")
 
 
-def control_trajectory(params, initial=(0, 1, 1.05), steps=300, integrator=euler_step):
-    traj = tensor_data(
-        *initial,
-        lambda s: control_force(s, params),
+def rollout_closed_loop(params, state0=(0, 1, 1.05), steps=300, integrator=euler_step):
+    traj = rollout_torch(
+        state0,
+        lambda s: linear_policy(params, s),
         steps=steps,
         integrator=integrator,
     )
-    return traj.detach().numpy(), controller_actions(traj, params)
+    return traj.detach().numpy(), control_series(params, traj)
 
 
-def plot_control(
-    pts,
-    us,
-    regularized=False,
+def plot_state_and_control(
+    traj,
+    u,
+    penalize_effort=False,
     caption=None,
     axes=None,
 ):
     # COLORS = ("green", "orange", "black")
-    lyapunov_times = np.arange(len(pts)) * DT * LYAPUNOV_EXP
+    times = np.arange(len(traj)) * DT * LYAPUNOV_EXP
 
     own_figure = axes is None
 
@@ -54,19 +52,19 @@ def plot_control(
 
     ax_traj.axhline(0, color="black", linestyle="--", linewidth=1)
     for i, label in enumerate("xyz"):
-        ax_traj.plot(lyapunov_times, pts[:, i], linewidth=0.6, label=label)
+        ax_traj.plot(times, traj[:, i], linewidth=0.6, label=label)
     ax_traj.set_ylabel("state")
 
     title = "Controlled Lorenz trajectory"
 
-    if regularized:
+    if penalize_effort:
         title += " (regularized)"
 
     ax_traj.set_title(title)
     ax_traj.legend(loc="upper right")
 
     ax_u.axhline(0, color="black", linestyle="--", linewidth=1)
-    ax_u.plot(lyapunov_times, us, color="crimson", linewidth=0.6)
+    ax_u.plot(times, u, color="crimson", linewidth=0.6)
     ax_u.set_ylabel("control u = w·s + b")
     ax_u.set_xlabel("Lyapunov times (t / τ)")
     ax_u.set_title("Controller action")
@@ -77,10 +75,10 @@ def plot_control(
         add_caption(fig, caption)
 
 
-def plot_control_attractor(
-    pts,
-    us,
-    regularized=False,
+def plot_attractor_3d(
+    traj,
+    u,
+    penalize_effort=False,
     caption=None,
     ax=None,
 ):
@@ -95,16 +93,16 @@ def plot_control_attractor(
 
     title = "Controlled trajectory"
 
-    if regularized:
+    if penalize_effort:
         title += " (regularized)"
     ax.set_title(title)
 
-    segments = np.stack([pts[:-1], pts[1:]], axis=1)
+    segments = np.stack([traj[:-1], traj[1:]], axis=1)
     lc = Line3DCollection(segments, cmap="coolwarm", linewidths=0.8)
-    lc.set_array(us[:-1])
+    lc.set_array(u[:-1])
     ax.add_collection(lc)
 
-    ax.auto_scale_xyz(pts[:, 0], pts[:, 1], pts[:, 2])
+    ax.auto_scale_xyz(traj[:, 0], traj[:, 1], traj[:, 2])
 
     ax.figure.colorbar(lc, ax=ax, shrink=0.6, pad=0.11, label="control u")
 
@@ -112,20 +110,16 @@ def plot_control_attractor(
         add_caption(ax.figure, caption)
 
 
-def plot_gradient_growth(
-    initial_x, initial_y, initial_z, ut, lyapunov_times=1.0, coord=0
-):
-    horizons = np.linspace(0.1, lyapunov_times, 40)
+def plot_state_sensitivity_vs_horizon(state0, u_tensor, max_horizon=1.0, coord=0):
+    horizons = np.linspace(0.1, max_horizon, 40)
     grads = [
-        position_gradient(
-            initial_x, initial_y, initial_z, ut, lyapunov_times=lt, coord=coord
-        )[1]
-        for lt in horizons
+        final_state_sensitivity(state0, u_tensor, horizon=horizon, coord=coord)[1]
+        for horizon in horizons
     ]
 
-    fig = plt.figure().add_subplot()
-    fig.semilogy(horizons, np.abs(grads), color="red", linewidth=0.5)
-    fig.plot(
+    ax = plt.figure().add_subplot()
+    ax.semilogy(horizons, np.abs(grads), color="red", linewidth=0.5)
+    ax.plot(
         horizons,
         np.exp(np.asarray(horizons)),
         linestyle="--",
@@ -134,32 +128,32 @@ def plot_gradient_growth(
         label="e^(t/τ)",
     )
 
-    fig.set_xlabel("Lyapunov times (t / τ)")
-    fig.set_ylabel("|∂x(t) / ∂u|")
-    fig.set_title("Gradient growth vs. horizon")
-    fig.legend()
+    ax.set_xlabel("Lyapunov times (t / τ)")
+    ax.set_ylabel("|∂x(t) / ∂u|")
+    ax.set_title("Gradient growth vs. horizon")
+    ax.legend()
     plt.show()
 
 
-def plot_gradient_vs_window(
-    ic=(0, 1, 1.05), max_lt=8.0, n=50, save=False, integrator=euler_step
+def plot_loss_gradient_vs_horizon(
+    state0=(0, 1, 1.05), max_horizon=8.0, n=50, save=False, integrator=euler_step
 ):
-    windows = np.linspace(0.1, max_lt, n)
+    horizons = np.linspace(0.1, max_horizon, n)
     norms = []
-    for lt in windows:
-        params = create_controller()
-        steps = round(lt / (LYAPUNOV_EXP * DT))
-        traj = tensor_data(
-            *ic,
-            lambda s: control_force(s, params),
+    for horizon in horizons:
+        params = init_policy_params()
+        steps = round(horizon / (LYAPUNOV_EXP * DT))
+        traj = rollout_torch(
+            state0,
+            lambda s: linear_policy(params, s),
             steps=steps,
             integrator=integrator,
         )
-        g = torch.autograd.grad(calculate_loss(traj), params)
-        norms.append(torch.cat([gi.reshape(-1) for gi in g]).norm().item())
+        grads = torch.autograd.grad(task_loss(traj), params)
+        norms.append(torch.cat([g.reshape(-1) for g in grads]).norm().item())
 
     ax = plt.figure().add_subplot()
-    ax.semilogy(windows, norms, color="red", linewidth=0.8)
+    ax.semilogy(horizons, norms, color="red", linewidth=0.8)
     ax.set_xlabel("Lyapunov times (t / τ)")
     ax.set_ylabel("Loss-gradient")
     ax.set_title("Loss-gradient blowup vs. training window")
@@ -168,8 +162,8 @@ def plot_gradient_vs_window(
     add_caption(
         ax.figure,
         settings_caption(
-            ic=f"({','.join(str(v) for v in ic)})",
-            gg=max_lt,
+            initial_condition=f"({','.join(str(v) for v in state0)})",
+            max_horizon=max_horizon,
             n=n,
             dt=DT,
             rk4="on" if integrator is rk4_step else "off",
@@ -178,21 +172,23 @@ def plot_gradient_vs_window(
 
     if save:
         plt.savefig(
-            f"./plots/gradient_growth/{int(max_lt)}.png", dpi=150, bbox_inches="tight"
+            f"./plots/gradient_growth/{int(max_horizon)}.png",
+            dpi=150,
+            bbox_inches="tight",
         )
-        print(f"Saved to ./plots/gradient_growth/{int(max_lt)}.png")
+        print(f"Saved to ./plots/gradient_growth/{int(max_horizon)}.png")
     else:
         plt.show()
 
 
 def plot_loss_curve(
     history,
-    ic=[0, 1, 1.05],
+    state0=[0, 1, 1.05],
     lr=0.05,
-    train_lyapunov_times=1.0,
+    train_horizon=1.0,
     iters=600,
-    regularized=False,
-    lam=LAMBDA,
+    penalize_effort=False,
+    effort_weight=DEFAULT_EFFORT_WEIGHT,
     integrator=euler_step,
     save=False,
 ):
@@ -202,7 +198,7 @@ def plot_loss_curve(
     ax = plt.figure(figsize=(9, 6)).add_subplot()
     ax.plot(iterations, total, color="crimson", linewidth=1.0, label="total loss")
 
-    # if regularized:
+    # if penalize_effort:
     #     ax.plot(iterations, task, color="tab:blue", linewidth=0.8, label="task")
     #     ax.plot(
     #         iterations, penalty, color="gray", linewidth=0.8, label=f"λ·effort"
@@ -216,13 +212,13 @@ def plot_loss_curve(
     print(f"loss: {total[0]:.4f} -> {total[-1]:.4f}   min {total.min():.4f}")
 
     caption = settings_caption(
-        ic=f"({','.join(str(v) for v in ic)})",
-        lr=lr,
-        tlt=train_lyapunov_times,
+        initial_condition=f"({','.join(str(v) for v in state0)})",
+        learning_rate=lr,
+        train_horizon=train_horizon,
         iters=iters,
-        lam=lam,
+        effort_weight=effort_weight,
         dt=DT,
-        l2="on" if regularized else "off",
+        penalize_effort="on" if penalize_effort else "off",
         rk4="on" if integrator is rk4_step else "off",
     )
 
@@ -232,8 +228,8 @@ def plot_loss_curve(
     if save:
         path = f"./plots/loss_sweep_{iters}/loss_v_iteration/"
         # same stem as the attractor plots so the two directories line up
-        filename = f"lambda{lam}_{train_lyapunov_times}"
-        filename += "_regularized" if regularized else "_unregularized"
+        filename = f"lambda{effort_weight}_{train_horizon}"
+        filename += "_regularized" if penalize_effort else "_unregularized"
 
         if integrator is rk4_step:
             filename += "_rk4"
@@ -260,64 +256,78 @@ def plot_success_vs_lambda(path="./plots/loss_sweep_1000/success.csv", save=Fals
     if not rows:
         raise SystemExit(f"no success values in {path}")
 
-    lams = sorted({float(row["lam"]) for row in rows})
-    tlts = sorted({float(row["tlt"]) for row in rows})
-    success = {(float(row["lam"]), float(row["tlt"])): float(row["success"]) for row in rows}
+    effort_weights = sorted({float(row["effort_weight"]) for row in rows})
+    train_horizons = sorted({float(row["train_horizon"]) for row in rows})
+    success = {
+        (float(row["effort_weight"]), float(row["train_horizon"])): float(
+            row["success"]
+        )
+        for row in rows
+    }
 
-    def line(tlt):
-        xs = [lam for lam in lams if (lam, tlt) in success]
+    def series_for(train_horizon):
+        xs = [weight for weight in effort_weights if (weight, train_horizon) in success]
 
-        return xs, [success[(lam, tlt)] for lam in xs]
+        return xs, [success[(weight, train_horizon)] for weight in xs]
 
-    norm = plt.Normalize(min(tlts), max(tlts))
+    norm = plt.Normalize(min(train_horizons), max(train_horizons))
     cmap = plt.colormaps["viridis"]
 
-    cols = min(4, len(tlts))
-    grid_rows = -(-len(tlts) // cols)
+    n_cols = min(4, len(train_horizons))
+    n_rows = -(-len(train_horizons) // n_cols)
 
     fig, axes = plt.subplots(
-        grid_rows,
-        cols,
-        figsize=(3.6 * cols, 2.9 * grid_rows),
+        n_rows,
+        n_cols,
+        figsize=(3.6 * n_cols, 2.9 * n_rows),
         sharex=True,
         sharey=True,
     )
-    flat = np.atleast_1d(axes).ravel()
+    panels = np.atleast_1d(axes).ravel()
 
-    for ax, tlt in zip(flat, tlts):
+    for ax, train_horizon in zip(panels, train_horizons):
         # the other windows in grey give each panel back the context it loses
 
-        ax.plot(*line(tlt), color=cmap(norm(tlt)), linewidth=1.8, marker="o", markersize=4)
+        ax.plot(
+            *series_for(train_horizon),
+            color=cmap(norm(train_horizon)),
+            linewidth=1.8,
+            marker="o",
+            markersize=4,
+        )
 
-        ax.set_title(f"tlt = {tlt}", fontsize=10)
+        ax.set_title(f"train_horizon = {train_horizon}", fontsize=10)
         ax.set_ylim(-0.03, 1.05)
         ax.grid(alpha=0.25, linewidth=0.6)
 
-    for ax in flat[len(tlts) :]:
+    for ax in panels[len(train_horizons) :]:
         ax.set_visible(False)
 
     # sharex hides tick labels everywhere but the bottom row, so the panels in
     # a column that the grid leaves short would otherwise lose their x axis
-    for column in range(cols):
-        bottom = [i for i in range(column, len(tlts), cols)]
-        if bottom:
-            flat[bottom[-1]].tick_params(labelbottom=True)
+    for column in range(n_cols):
+        column_panels = [i for i in range(column, len(train_horizons), n_cols)]
+        if column_panels:
+            panels[column_panels[-1]].tick_params(labelbottom=True)
 
     fig.supxlabel("λ (control-effort penalty)", y=0.03)
     fig.supylabel("success (fraction of time x > 0)")
     fig.suptitle("Success vs. regularizer strength, by training window")
 
-    for tlt in tlts:
-        xs, ys = line(tlt)
-        print(f"tlt={tlt}: best success {max(ys):.4f} at lam={xs[ys.index(max(ys))]}")
+    for train_horizon in train_horizons:
+        xs, ys = series_for(train_horizon)
+        print(
+            f"train_horizon={train_horizon}: best success {max(ys):.4f} "
+            f"at effort_weight={xs[ys.index(max(ys))]}"
+        )
 
     settings = rows[0]
     caption = settings_caption(
-        lr=settings["lr"],
+        learning_rate=settings["learning_rate"],
         iters=settings["iters"],
-        plt=settings["plt"],
+        plot_horizon=settings["plot_horizon"],
         dt=DT,
-        l2="on" if settings["l2"] == "1" else "off",
+        penalize_effort="on" if settings["penalize_effort"] == "1" else "off",
         rk4="on" if settings["rk4"] == "1" else "off",
         runs=len(rows),
     )
@@ -334,41 +344,41 @@ def plot_success_vs_lambda(path="./plots/loss_sweep_1000/success.csv", save=Fals
         plt.show()
 
 
-def control_plots(
+def plot_run_summary(
     params,
-    ic=[0, 1, 1.05],
+    state0=[0, 1, 1.05],
     lr=0.05,
-    train_lyapunov_times=1.0,
-    plot_lyapunov_times=25,
+    train_horizon=1.0,
+    plot_horizon=25,
     iters=600,
-    regularized=False,
+    penalize_effort=False,
     save=False,
-    lam=LAMBDA,
+    effort_weight=DEFAULT_EFFORT_WEIGHT,
     integrator=euler_step,
-    pts=None,
-    us=None,
+    traj=None,
+    u=None,
 ):
     # a caller that batched the rollout already holds the trajectory, and
     # re-integrating it one lambda at a time would undo the point of batching
-    if pts is None:
-        steps = round(plot_lyapunov_times / (LYAPUNOV_EXP * DT))
-        pts, us = control_trajectory(
-            params, initial=ic, steps=steps, integrator=integrator
+    if traj is None:
+        steps = round(plot_horizon / (LYAPUNOV_EXP * DT))
+        traj, u = rollout_closed_loop(
+            params, state0=state0, steps=steps, integrator=integrator
         )
 
-    success = success_fraction(pts)
+    success = success_fraction(traj)
     # sweep.py scrapes this line, so keep the prefix stable
     print(f"success (fraction of time x > 0): {success:.6f}")
 
     caption = settings_caption(
-        ic=f"({','.join(str(v) for v in ic)})",
-        lr=lr,
-        tlt=train_lyapunov_times,
-        plt=plot_lyapunov_times,
+        initial_condition=f"({','.join(str(v) for v in state0)})",
+        learning_rate=lr,
+        train_horizon=train_horizon,
+        plot_horizon=plot_horizon,
         iters=iters,
-        lam=lam,
+        effort_weight=effort_weight,
         dt=DT,
-        l2="on" if regularized else "off",
+        penalize_effort="on" if penalize_effort else "off",
         rk4="on" if integrator is rk4_step else "off",
         success=f"{success:.3f}",
     )
@@ -379,17 +389,19 @@ def control_plots(
     ax_traj = fig.add_subplot(gs[0, 1])
     ax_u = fig.add_subplot(gs[1, 1], sharex=ax_traj)
 
-    plot_control(pts, us, regularized=regularized, axes=(ax_traj, ax_u))
-    plot_control_attractor(pts, us, regularized=regularized, ax=ax_attractor)
+    plot_state_and_control(
+        traj, u, penalize_effort=penalize_effort, axes=(ax_traj, ax_u)
+    )
+    plot_attractor_3d(traj, u, penalize_effort=penalize_effort, ax=ax_attractor)
 
     fig.tight_layout(rect=(0, 0.03, 1, 1) if caption else None)
     add_caption(fig, caption)
 
     if save:
         path = f"./plots/loss_sweep_{iters}/attractor/"
-        filename = f"lambda{lam}_{train_lyapunov_times}"
+        filename = f"lambda{effort_weight}_{train_horizon}"
 
-        if regularized:
+        if penalize_effort:
             filename += "_regularized"
         else:
             filename += "_unregularized"
@@ -417,11 +429,13 @@ if __name__ == "__main__":
         metavar=("X", "Y", "Z"),
     )
     parser.add_argument("-lr", "--learning_rate", type=float, default=0.05)
-    parser.add_argument("-tlt", "--train_lyapunov_times", type=float, default=1)
-    parser.add_argument("-plt", "--plot_lyapunov_times", type=float, default=100)
+    parser.add_argument("-th", "--train_horizon", type=float, default=1)
+    parser.add_argument("-ph", "--plot_horizon", type=float, default=100)
     parser.add_argument("-i", "--iters", type=int, default=600)
-    parser.add_argument("-lam", "--tuning_rate", type=float, default=0.07)
-    parser.add_argument("-gg", "--gradient_growth", type=float, default=0)
+    parser.add_argument(
+        "-lam", "--effort_weight", type=float, default=DEFAULT_EFFORT_WEIGHT
+    )
+    parser.add_argument("-lgh", "--loss_gradient_horizon", type=float, default=0)
     parser.add_argument(
         "-sc",
         "--success_csv",
@@ -433,31 +447,29 @@ if __name__ == "__main__":
 
     flags = parser.add_argument_group(title="Flags")
     flags.add_argument("-s", "--save", action="store_true")
-    flags.add_argument("-l2", "--l2_regularized", action="store_true")
+    flags.add_argument("-pe", "--penalize_effort", action="store_true")
     flags.add_argument("-rk4", "--rk4", action="store_true")
     flags.add_argument("-loss", "--loss_curve", action="store_true")
     args = parser.parse_args()
 
     if args.success_csv:
         plot_success_vs_lambda(args.success_csv, save=args.save)
-    elif args.gradient_growth:
-        plot_gradient_vs_window(
-            ic=args.initial_condition,
-            max_lt=args.gradient_growth,
+    elif args.loss_gradient_horizon:
+        plot_loss_gradient_vs_horizon(
+            state0=args.initial_condition,
+            max_horizon=args.loss_gradient_horizon,
             integrator=rk4_step if args.rk4 else euler_step,
         )
     else:
         integrator = rk4_step if args.rk4 else euler_step
-
-        # trained once here, then shared by both plots
         history = []
-        params = optimize_gradient(
-            ic=args.initial_condition,
+        params = train_policy(
+            state0=args.initial_condition,
             lr=args.learning_rate,
-            lyapunov_times=args.train_lyapunov_times,
+            horizon=args.train_horizon,
             iters=args.iters,
-            regularized=args.l2_regularized,
-            lam=args.tuning_rate,
+            penalize_effort=args.penalize_effort,
+            effort_weight=args.effort_weight,
             integrator=integrator,
             history=history,
         )
@@ -465,25 +477,25 @@ if __name__ == "__main__":
         if args.loss_curve:
             plot_loss_curve(
                 history,
-                ic=args.initial_condition,
+                state0=args.initial_condition,
                 lr=args.learning_rate,
-                train_lyapunov_times=args.train_lyapunov_times,
+                train_horizon=args.train_horizon,
                 iters=args.iters,
-                regularized=args.l2_regularized,
-                lam=args.tuning_rate,
+                penalize_effort=args.penalize_effort,
+                effort_weight=args.effort_weight,
                 integrator=integrator,
                 save=args.save,
             )
 
-        control_plots(
+        plot_run_summary(
             params,
-            ic=args.initial_condition,
+            state0=args.initial_condition,
             lr=args.learning_rate,
-            train_lyapunov_times=args.train_lyapunov_times,
-            plot_lyapunov_times=args.plot_lyapunov_times,
+            train_horizon=args.train_horizon,
+            plot_horizon=args.plot_horizon,
             iters=args.iters,
-            regularized=args.l2_regularized,
+            penalize_effort=args.penalize_effort,
             save=args.save,
-            lam=args.tuning_rate,
+            effort_weight=args.effort_weight,
             integrator=integrator,
         )

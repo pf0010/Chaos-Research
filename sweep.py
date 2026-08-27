@@ -37,18 +37,18 @@ def frange(start, stop, step):
     return values
 
 
-def build_command(lam, tlt, args):
+def build_command(lam, train_horizon, args):
     cmd = [
         sys.executable,
         SCRIPT,
         "-lam",
         str(lam),
-        "-tlt",
-        str(tlt),
+        "-th",
+        str(train_horizon),
         "-lr",
         str(args.learning_rate),
-        "-plt",
-        str(args.plot_lyapunov_times),
+        "-ph",
+        str(args.plot_horizon),
         "-i",
         str(args.iters),
         "-ic",
@@ -56,8 +56,8 @@ def build_command(lam, tlt, args):
         "-s",
     ]
 
-    if not args.unregularized:
-        cmd.append("-l2")
+    if not args.no_penalize_effort:
+        cmd.append("-pe")
     if args.rk4:
         cmd.append("-rk4")
     if args.loss_curve:
@@ -85,18 +85,29 @@ def write_csv(path, rows, args):
 
     with open(path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["lam", "tlt", "success", "lr", "iters", "plt", "l2", "rk4"])
+        writer.writerow(
+            [
+                "effort_weight",
+                "train_horizon",
+                "success",
+                "learning_rate",
+                "iters",
+                "plot_horizon",
+                "penalize_effort",
+                "rk4",
+            ]
+        )
 
-        for lam, tlt, success in sorted(rows):
+        for lam, train_horizon, success in sorted(rows):
             writer.writerow(
                 [
                     lam,
-                    tlt,
+                    train_horizon,
                     "" if success is None else f"{success:.6f}",
                     args.learning_rate,
                     args.iters,
-                    args.plot_lyapunov_times,
-                    int(not args.unregularized),
+                    args.plot_horizon,
+                    int(not args.no_penalize_effort),
                     int(args.rk4),
                 ]
             )
@@ -109,9 +120,9 @@ if __name__ == "__main__":
     parser.add_argument("--lam_start", type=float, default=0.05)
     parser.add_argument("--lam_stop", type=float, default=0.15)
     parser.add_argument("--lam_step", type=float, default=0.01)
-    parser.add_argument("--tlt_start", type=float, default=1.0)
-    parser.add_argument("--tlt_stop", type=float, default=2.0)
-    parser.add_argument("--tlt_step", type=float, default=0.25)
+    parser.add_argument("--th_start", type=float, default=1.0)
+    parser.add_argument("--th_stop", type=float, default=2.0)
+    parser.add_argument("--th_step", type=float, default=0.25)
 
     parser.add_argument(
         "-j",
@@ -131,7 +142,7 @@ if __name__ == "__main__":
         metavar=("X", "Y", "Z"),
     )
     parser.add_argument("-lr", "--learning_rate", type=float, default=0.05)
-    parser.add_argument("-plt", "--plot_lyapunov_times", type=float, default=100)
+    parser.add_argument("-ph", "--plot_horizon", type=float, default=100)
     parser.add_argument("-i", "--iters", type=int, default=600)
 
     parser.add_argument(
@@ -149,25 +160,25 @@ if __name__ == "__main__":
         help="also save a loss-vs-iteration plot for every grid point",
     )
     flags.add_argument(
-        "-u",
-        "--unregularized",
+        "-npe",
+        "--no_penalize_effort",
         action="store_true",
-        help="drop -l2; lambda then has no effect on training",
+        help="drop -pe; lambda then has no effect on training",
     )
     flags.add_argument("--dry_run", "--dry-run", action="store_true", dest="dry_run")
     args = parser.parse_args()
 
     lams = frange(args.lam_start, args.lam_stop, args.lam_step)
-    tlts = frange(args.tlt_start, args.tlt_stop, args.tlt_step)
-    grid = [(lam, tlt) for lam in lams for tlt in tlts]
+    train_horizons = frange(args.th_start, args.th_stop, args.th_step)
+    grid = [(lam, th) for lam in lams for th in train_horizons]
 
-    print(f"lambda: {lams}")
-    print(f"tlt:    {tlts}")
+    print(f"effort_weight: {lams}")
+    print(f"train_horizon: {train_horizons}")
     print(f"{len(grid)} runs, {args.jobs} at a time")
 
     if args.dry_run:
-        for lam, tlt in grid:
-            print(" ".join(build_command(lam, tlt, args)))
+        for lam, th in grid:
+            print(" ".join(build_command(lam, th, args)))
         sys.exit(0)
 
     # each run is single-threaded so the workers don't oversubscribe the CPU,
@@ -185,35 +196,36 @@ if __name__ == "__main__":
 
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
         futures = {
-            pool.submit(run, build_command(lam, tlt, args), env): (lam, tlt)
-            for lam, tlt in grid
+            pool.submit(run, build_command(lam, th, args), env): (lam, th)
+            for lam, th in grid
         }
 
         for done, future in enumerate(as_completed(futures), start=1):
-            lam, tlt = futures[future]
+            lam, th = futures[future]
             proc, elapsed = future.result()
             status = "ok " if proc.returncode == 0 else "FAIL"
             success = parse_success(proc.stdout) if proc.returncode == 0 else None
-            rows.append((lam, tlt, success))
+            rows.append((lam, th, success))
 
             print(
-                f"[{done}/{len(grid)}] {status} lam={lam} tlt={tlt}  {elapsed:.1f}s"
+                f"[{done}/{len(grid)}] {status} effort_weight={lam} "
+                f"train_horizon={th}  {elapsed:.1f}s"
                 f"  success={'--' if success is None else f'{success:.4f}'}",
                 flush=True,
             )
 
             if proc.returncode != 0:
-                failures.append((lam, tlt, proc.stderr.strip()))
+                failures.append((lam, th, proc.stderr.strip()))
 
     print(f"\nfinished in {time.monotonic() - started:.1f}s")
 
     write_csv(args.csv, rows, args)
 
-    missing = [(lam, tlt) for lam, tlt, s in rows if s is None]
+    missing = [(lam, th) for lam, th, s in rows if s is None]
     if missing:
         print(f"{len(missing)} of {len(rows)} runs reported no success rate")
 
-    for lam, tlt, stderr in failures:
-        print(f"\nlam={lam} tlt={tlt} failed:\n{stderr}")
+    for lam, th, stderr in failures:
+        print(f"\neffort_weight={lam} train_horizon={th} failed:\n{stderr}")
 
     sys.exit(1 if failures else 0)
