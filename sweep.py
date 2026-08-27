@@ -7,15 +7,25 @@ parallelized simply by running several of them at once.
     python sweep.py -j 4            # cap at 4 concurrent runs
     python sweep.py -loss           # also save a loss-vs-iteration plot per point
     python sweep.py -np             # skip the success-vs-lambda plot at the end
-    python sweep.py -sc             # just plot an existing csv, no grid
+    python sweep.py -sc             # just replot the latest sweep, no grid
     python sweep.py --dry-run       # print the commands without running them
 
-Every run writes the success rate of each grid point to --csv and then plots
-it; -sc reads that same file back.
+Each sweep claims the next number from plots/.sweep_counter and writes
+everything it produces into that one directory:
+
+    plots/sweep_007/
+        success.csv                 # one row per grid point
+        success_v_lambda.png        # unless -np
+        attractor/                  # one png per grid point
+        loss_v_iteration/           # one png per grid point, with -loss
+
+Numbers are never reused, so a directory name stays a stable reference to one
+run. -sc with no argument replots the most recent one.
 """
 
 import argparse
 import csv
+import glob
 import os
 import re
 import subprocess
@@ -26,9 +36,49 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_control.py")
 SUCCESS_RE = re.compile(r"success \(fraction of time x > 0\): ([0-9.]+)")
 
-# one default for both ends of the round trip: what a sweep writes is what
-# -sc and --plot read back
-DEFAULT_CSV = "./plots/loss_sweep/success.csv"
+SWEEP_ROOT = "./plots"
+COUNTER = os.path.join(SWEEP_ROOT, ".sweep_counter")
+
+
+def claim_sweep_dir():
+    """Create the next numbered directory under plots/ and return its path.
+
+    The counter file is what makes the numbering monotonic: deleting old sweeps
+    doesn't hand their numbers out again, so a directory name stays a stable
+    reference to one run. mkdir is the actual claim, so two sweeps started at
+    the same moment can't both take the same number.
+    """
+    os.makedirs(SWEEP_ROOT, exist_ok=True)
+
+    try:
+        with open(COUNTER) as f:
+            n = int(f.read().strip())
+    except (FileNotFoundError, ValueError):
+        n = 0
+
+    while True:
+        n += 1
+        path = os.path.join(SWEEP_ROOT, f"sweep_{n:03d}")
+
+        try:
+            os.mkdir(path)
+            break
+        except FileExistsError:
+            continue
+
+    with open(COUNTER, "w") as f:
+        f.write(str(n))
+
+    return path
+
+
+def latest_sweep_csv():
+    found = glob.glob(os.path.join(SWEEP_ROOT, "sweep_*", "success.csv"))
+
+    if not found:
+        raise SystemExit(f"no sweeps found under {SWEEP_ROOT}")
+
+    return max(found, key=os.path.getmtime)
 
 
 def plot_csv(path, save):
@@ -51,7 +101,7 @@ def frange(start, stop, step):
     return values
 
 
-def build_command(lam, train_horizon, args):
+def build_command(lam, train_horizon, args, sweep_dir):
     cmd = [
         sys.executable,
         SCRIPT,
@@ -67,6 +117,8 @@ def build_command(lam, train_horizon, args):
         str(args.iters),
         "-ic",
         *(str(v) for v in args.initial_condition),
+        "-o",
+        sweep_dir,
         "-s",
     ]
 
@@ -161,16 +213,16 @@ if __name__ == "__main__":
 
     parser.add_argument(
         "--csv",
-        default=DEFAULT_CSV,
-        help="where to write the success rates (default: %(default)s)",
+        default=None,
+        help="where to write the success rates (default: <sweep dir>/success.csv)",
     )
     parser.add_argument(
         "-sc",
         "--success_csv",
         nargs="?",
-        const=DEFAULT_CSV,
+        const="",
         default=None,
-        help="plot success vs lambda from an existing csv instead of sweeping",
+        help="plot an existing csv instead of sweeping (default: the latest sweep)",
     )
 
     flags = parser.add_argument_group(title="Flags")
@@ -179,7 +231,8 @@ if __name__ == "__main__":
         "-np",
         "--no_plot",
         action="store_true",
-        help="skip the success-vs-lambda plot the grid otherwise saves next to --csv",
+        help="skip the success-vs-lambda plot the grid otherwise saves alongside "
+        "its csv",
     )
     flags.add_argument("-rk4", "--rk4", action="store_true")
     flags.add_argument(
@@ -197,8 +250,8 @@ if __name__ == "__main__":
     flags.add_argument("--dry_run", "--dry-run", action="store_true", dest="dry_run")
     args = parser.parse_args()
 
-    if args.success_csv:
-        plot_csv(args.success_csv, save=args.save)
+    if args.success_csv is not None:
+        plot_csv(args.success_csv or latest_sweep_csv(), save=args.save)
         sys.exit(0)
 
     lams = frange(args.lam_start, args.lam_stop, args.lam_step)
@@ -210,9 +263,14 @@ if __name__ == "__main__":
     print(f"{len(grid)} runs, {args.jobs} at a time")
 
     if args.dry_run:
+        # a dry run claims no number, so the directory here is a placeholder
         for lam, th in grid:
-            print(" ".join(build_command(lam, th, args)))
+            print(" ".join(build_command(lam, th, args, f"{SWEEP_ROOT}/sweep_NNN")))
         sys.exit(0)
+
+    sweep_dir = claim_sweep_dir()
+    csv_path = args.csv or os.path.join(sweep_dir, "success.csv")
+    print(f"writing to {sweep_dir}")
 
     # each run is single-threaded so the workers don't oversubscribe the CPU,
     # and Agg keeps matplotlib from reaching for a GUI backend
@@ -229,7 +287,7 @@ if __name__ == "__main__":
 
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
         futures = {
-            pool.submit(run, build_command(lam, th, args), env): (lam, th)
+            pool.submit(run, build_command(lam, th, args, sweep_dir), env): (lam, th)
             for lam, th in grid
         }
 
@@ -252,13 +310,13 @@ if __name__ == "__main__":
 
     print(f"\nfinished in {time.monotonic() - started:.1f}s")
 
-    write_csv(args.csv, rows, args)
+    write_csv(csv_path, rows, args)
 
     # a finished sweep is usually headless, so write the figure rather than
     # blocking on a window nobody is watching. an all-failed grid has nothing to
     # plot, and raising over it would bury the failure report below.
     if not args.no_plot and any(success is not None for _, _, success in rows):
-        plot_csv(args.csv, save=True)
+        plot_csv(csv_path, save=True)
 
     missing = [(lam, th) for lam, th, s in rows if s is None]
     if missing:

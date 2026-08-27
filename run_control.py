@@ -34,6 +34,13 @@ if __name__ == "__main__":
         "-lam", "--effort_weight", type=float, default=DEFAULT_EFFORT_WEIGHT
     )
     parser.add_argument("-lgh", "--loss_gradient_horizon", type=float, default=0)
+    parser.add_argument(
+        "-o",
+        "--out_dir",
+        default=None,
+        help="where -s writes (default: ./plots/loss_sweep_<iters>); sweep.py "
+        "points every grid point at its own sweep directory",
+    )
 
     flags = parser.add_argument_group(title="Flags")
     flags.add_argument("-s", "--save", action="store_true")
@@ -74,6 +81,7 @@ if __name__ == "__main__":
                 effort_weight=args.effort_weight,
                 integrator=integrator,
                 save=args.save,
+                out_dir=args.out_dir,
             )
 
         plot_run_summary(
@@ -87,4 +95,5 @@ if __name__ == "__main__":
             save=args.save,
             effort_weight=args.effort_weight,
             integrator=integrator,
+            out_dir=args.out_dir,
         )

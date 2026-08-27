@@ -31,6 +31,12 @@ from training import (
 )
 
 
+def run_output_dir(iters, out_dir=None):
+    # a sweep hands every grid point its own directory; a standalone run falls
+    # back to the iters-keyed layout the older plots use
+    return out_dir if out_dir else f"./plots/loss_sweep_{iters}"
+
+
 def control_series(params, traj):
     w, b = params
     states = (
@@ -291,6 +297,7 @@ def plot_loss_curve(
     effort_weight=DEFAULT_EFFORT_WEIGHT,
     integrator=euler_step,
     save=False,
+    out_dir=None,
 ):
     task, penalty, total = np.asarray(history).T
     iterations = np.arange(len(total))
@@ -326,7 +333,7 @@ def plot_loss_curve(
     add_caption(ax.figure, caption)
 
     if save:
-        path = f"./plots/loss_sweep_{iters}/loss_v_iteration/"
+        path = os.path.join(run_output_dir(iters, out_dir), "loss_v_iteration")
         # same stem as the attractor plots so the two directories line up
         filename = f"lambda{effort_weight}_{train_horizon}"
         filename += "_regularized" if penalize_effort else "_unregularized"
@@ -336,8 +343,9 @@ def plot_loss_curve(
 
         filename += "_loss"
         os.makedirs(path, exist_ok=True)
-        plt.savefig(path + filename + ".png", dpi=150, bbox_inches="tight")
-        print(f"Saved to {path + filename}.png")
+        out = os.path.join(path, filename + ".png")
+        plt.savefig(out, dpi=150, bbox_inches="tight")
+        print(f"Saved to {out}")
         plt.close(ax.figure)
     else:
         plt.show()
@@ -457,6 +465,7 @@ def plot_run_summary(
     integrator=euler_step,
     traj=None,
     u=None,
+    out_dir=None,
 ):
     # a caller that batched the rollout already holds the trajectory, and
     # re-integrating it one lambda at a time would undo the point of batching
@@ -498,7 +507,7 @@ def plot_run_summary(
     add_caption(fig, caption)
 
     if save:
-        path = f"./plots/loss_sweep_{iters}/attractor/"
+        path = os.path.join(run_output_dir(iters, out_dir), "attractor")
         filename = f"lambda{effort_weight}_{train_horizon}"
 
         if penalize_effort:
@@ -510,8 +519,9 @@ def plot_run_summary(
             filename += "_rk4"
 
         os.makedirs(path, exist_ok=True)
-        plt.savefig(path + filename + ".png", dpi=150, bbox_inches="tight")
-        print(f"Saved to {path + filename}.png")
+        out = os.path.join(path, filename + ".png")
+        plt.savefig(out, dpi=150, bbox_inches="tight")
+        print(f"Saved to {out}")
         # a sweep stays in one process, so an unclosed figure per grid point piles up
         plt.close(fig)
     else:
