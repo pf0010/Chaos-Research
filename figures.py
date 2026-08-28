@@ -75,12 +75,16 @@ def add_caption(fig, caption):
 
 
 def rollout_closed_loop(params, state0=(0, 1, 1.05), steps=300, integrator=euler_step):
-    traj = rollout_torch(
-        state0,
-        lambda s: linear_policy(params, s),
-        steps=steps,
-        integrator=integrator,
-    )
+    # the trajectory is only ever plotted, and taping a rollout this long costs
+    # about as much again as integrating it
+    with torch.no_grad():
+        traj = rollout_torch(
+            state0,
+            lambda s: linear_policy(params, s),
+            steps=steps,
+            integrator=integrator,
+        )
+
     return traj.detach().numpy(), control_series(params, traj)
 
 

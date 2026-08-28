@@ -68,6 +68,48 @@ def effort_penalty(traj, params, u_ref=U_REF):
     return (u / u_ref).pow(2).mean()
 
 
+def effort_moments(state0, params, steps, integrator=euler_step):
+    """<s> and <s sᵀ> over a rollout we deliberately do not differentiate.
+
+    The penalty is quadratic in the policy, so these two moments are the whole
+    of what it needs from the trajectory -- nothing else about the states
+    survives into the loss. That lets the rollout run in numpy, which is a few
+    times cheaper than integrating the same steps as a torch graph, and keeps
+    the memory flat in `steps` instead of storing every state.
+    """
+    w, b = (param.detach().numpy() for param in params)
+
+    def control(state):
+        return float(w @ state + b)
+
+    state = np.array(state0, dtype=float)
+    m = np.zeros(3)
+    M = np.zeros((3, 3))
+
+    for _ in range(steps):
+        # accumulating before the step drops the final state, which is what
+        # effort_penalty's traj[:-1] does and for the same reason
+        m += state
+        M += np.outer(state, state)
+
+        state, _ = integrator(state, control)
+
+    return M / steps, m / steps
+
+
+def effort_from_moments(moments, params, u_ref=U_REF):
+    """effort_penalty on the moments: <u²> = wᵀMw + 2b mᵀw + b².
+
+    Same value and same gradient as effort_penalty over the states those
+    moments came from, since w and b are the only things it differentiates
+    through -- the states are frozen either way.
+    """
+    M, m = (torch.as_tensor(moment) for moment in moments)
+    w, b = params
+
+    return (w @ M @ w + 2 * b * (m @ w) + b * b) / u_ref**2
+
+
 def train_policy(
     state0=[0, 1, 1.05],
     params=None,
@@ -107,18 +149,13 @@ def train_policy(
         task = task_loss(traj)
 
         if penalize_effort and effort_steps != steps:
-            # states from a rollout we do not differentiate through: over this
+            # moments of a rollout we do not differentiate through: over this
             # many Lyapunov times the pathwise gradient is pure amplified noise
             # (run -lgh to see it blow up), so the gradient reaches w and b
             # through the policy alone. Cheap, and well conditioned.
-            with torch.no_grad():
-                effort_traj = rollout_torch(
-                    state0,
-                    lambda s: linear_policy(params, s),
-                    steps=effort_steps,
-                    integrator=integrator,
-                )
-            effort = effort_penalty(effort_traj, params)
+            effort = effort_from_moments(
+                effort_moments(state0, params, effort_steps, integrator), params
+            )
         else:
             # unpenalized runs only log the number, so keep the rollout short
             effort = effort_penalty(traj, params)
