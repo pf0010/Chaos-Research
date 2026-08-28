@@ -72,6 +72,7 @@ def train_policy(
     state0=[0, 1, 1.05],
     params=None,
     horizon=1.0,
+    effort_horizon=None,
     iters=600,
     lr=0.1,
     effort_weight=DEFAULT_EFFORT_WEIGHT,
@@ -82,6 +83,13 @@ def train_policy(
 ):
     # history, if given, is a list that collects (task, penalty, total) per iter
     steps = round(horizon / (LYAPUNOV_EXP * DT))
+    # the penalty is meant to price the control we actually deploy, so it is
+    # measured over the evaluation horizon rather than the training window --
+    # a law that looks cheap over one Lyapunov time can cost several times
+    # more once the run continues past it. None keeps the two windows equal.
+    effort_steps = (
+        steps if effort_horizon is None else round(effort_horizon / (LYAPUNOV_EXP * DT))
+    )
 
     if params is None:
         params = init_policy_params()
@@ -97,7 +105,23 @@ def train_policy(
             integrator=integrator,
         )
         task = task_loss(traj)
-        effort = effort_penalty(traj, params)
+
+        if penalize_effort and effort_steps != steps:
+            # states from a rollout we do not differentiate through: over this
+            # many Lyapunov times the pathwise gradient is pure amplified noise
+            # (run -lgh to see it blow up), so the gradient reaches w and b
+            # through the policy alone. Cheap, and well conditioned.
+            with torch.no_grad():
+                effort_traj = rollout_torch(
+                    state0,
+                    lambda s: linear_policy(params, s),
+                    steps=effort_steps,
+                    integrator=integrator,
+                )
+            effort = effort_penalty(effort_traj, params)
+        else:
+            # unpenalized runs only log the number, so keep the rollout short
+            effort = effort_penalty(traj, params)
 
         if penalize_effort:
             loss = task + effort_weight * effort

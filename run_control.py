@@ -78,6 +78,7 @@ if __name__ == "__main__":
             state0=args.initial_condition,
             lr=args.learning_rate,
             horizon=args.train_horizon,
+            effort_horizon=args.plot_horizon,
             iters=args.iters,
             penalize_effort=args.penalize_effort,
             effort_weight=args.effort_weight,
