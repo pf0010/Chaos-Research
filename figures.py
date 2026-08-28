@@ -4,6 +4,7 @@ Nothing here parses arguments; the run_* modules compose these into a run.
 """
 
 import csv
+import json
 import os
 
 import matplotlib.pyplot as plt
@@ -19,8 +20,17 @@ from lorenz import (
     rollout_numpy,
     rollout_torch,
 )
-from training import (
+from params import (
+    BY_NAME,
     DEFAULT_EFFORT_WEIGHT,
+    SWEEPABLE,
+    decimal_tag,
+    resolve,
+    run_values,
+    shown,
+    stem,
+)
+from training import (
     SOFTNESS,
     final_state_sensitivity,
     init_policy_params,
@@ -34,7 +44,17 @@ from training import (
 def run_output_dir(iters, out_dir=None):
     # a sweep hands every grid point its own directory; a standalone run falls
     # back to the iters-keyed layout the older plots use
-    return out_dir if out_dir else f"./plots/loss_sweep_{iters}"
+    return out_dir if out_dir else f"./plots/run_iters{iters}"
+
+
+def save_figure(fig, directory, values, name_keys):
+    """Write one figure under the name the registry derives for it."""
+    os.makedirs(directory, exist_ok=True)
+    out = os.path.join(directory, stem(values, name_keys) + ".png")
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    print(f"Saved to {out}")
+    # a sweep stays in one process, so an unclosed figure per grid point piles up
+    plt.close(fig)
 
 
 def control_series(params, traj):
@@ -277,12 +297,14 @@ def plot_loss_gradient_vs_horizon(
     )
 
     if save:
-        plt.savefig(
-            f"./plots/gradient_growth/{int(max_horizon)}.png",
-            dpi=150,
-            bbox_inches="tight",
-        )
-        print(f"Saved to ./plots/gradient_growth/{int(max_horizon)}.png")
+        # int(max_horizon) used to collide 8.0 with 8.4 and say nothing else
+        scheme = "rk4" if integrator is rk4_step else "euler"
+        name = f"maxh{decimal_tag(max_horizon)}_n{n}_int-{scheme}"
+        path = "./plots/gradient_growth"
+        os.makedirs(path, exist_ok=True)
+        out = os.path.join(path, name + ".png")
+        plt.savefig(out, dpi=150, bbox_inches="tight")
+        print(f"Saved to {out}")
     else:
         plt.show()
 
@@ -292,12 +314,14 @@ def plot_loss_curve(
     state0=[0, 1, 1.05],
     lr=0.05,
     train_horizon=1.0,
+    plot_horizon=100,
     iters=600,
     penalize_effort=False,
     effort_weight=DEFAULT_EFFORT_WEIGHT,
     integrator=euler_step,
     save=False,
     out_dir=None,
+    name_keys=None,
 ):
     task, penalty, total = np.asarray(history).T
     iterations = np.arange(len(total))
@@ -318,71 +342,135 @@ def plot_loss_curve(
 
     print(f"loss: {total[0]:.4f} -> {total[-1]:.4f}   min {total.min():.4f}")
 
-    caption = settings_caption(
-        initial_condition=f"({','.join(str(v) for v in state0)})",
+    values = run_values(
+        initial_condition=tuple(state0),
         learning_rate=lr,
         train_horizon=train_horizon,
+        plot_horizon=plot_horizon,
         iters=iters,
         effort_weight=effort_weight,
-        dt=DT,
-        penalize_effort="on" if penalize_effort else "off",
-        rk4="on" if integrator is rk4_step else "off",
+        penalize_effort=penalize_effort,
+        rk4=integrator is rk4_step,
     )
+    caption = settings_caption(**shown(values), dt=DT)
 
     ax.figure.tight_layout(rect=(0, 0.04, 1, 1))
     add_caption(ax.figure, caption)
 
     if save:
-        path = os.path.join(run_output_dir(iters, out_dir), "loss_v_iteration")
-        # same stem as the attractor plots so the two directories line up
-        filename = f"lambda{effort_weight}_{train_horizon}"
-        filename += "_regularized" if penalize_effort else "_unregularized"
-
-        if integrator is rk4_step:
-            filename += "_rk4"
-
-        filename += "_loss"
-        os.makedirs(path, exist_ok=True)
-        out = os.path.join(path, filename + ".png")
-        plt.savefig(out, dpi=150, bbox_inches="tight")
-        print(f"Saved to {out}")
-        plt.close(ax.figure)
+        # same stem as the attractor plots, so the two directories line up
+        save_figure(
+            ax.figure,
+            os.path.join(run_output_dir(iters, out_dir), "loss_v_iteration"),
+            values,
+            name_keys or SWEEPABLE,
+        )
     else:
         plt.show()
 
 
-def plot_success_vs_lambda(path, save=False):
-    """Plot the sweep's success metric against the regularizer strength λ.
+def sweep_axis_order(path):
+    """The order the sweep varied its axes in, from the manifest beside the csv.
 
-    One panel per training window, each shaded by window length. The panels
-    share x and y limits and carry the rest of the sweep behind them in grey,
-    so a panel is readable on its own and still comparable to its neighbours.
+    Without it the varying columns come back in registry order, which has
+    nothing to do with which axis the reader thinks of as x.
     """
+    manifest = os.path.join(os.path.dirname(path) or ".", "manifest.json")
+
+    try:
+        with open(manifest) as f:
+            return list(json.load(f).get("axes", {}))
+    except (OSError, ValueError):
+        return []
+
+
+def read_sweep_csv(path):
+    """Rows with a success value, plus which registry parameters actually vary."""
     with open(path, newline="") as f:
         rows = [row for row in csv.DictReader(f) if row["success"]]
 
     if not rows:
         raise SystemExit(f"no success values in {path}")
 
-    effort_weights = sorted({float(row["effort_weight"]) for row in rows})
-    train_horizons = sorted({float(row["train_horizon"]) for row in rows})
+    columns = [name for name in rows[0] if name in BY_NAME]
+    # a column the grid held fixed belongs in the caption, not on an axis
+    varying = [
+        name
+        for name in columns
+        if name in SWEEPABLE and len({row[name] for row in rows}) > 1
+    ]
+    order = sweep_axis_order(path)
+    varying.sort(key=lambda name: order.index(name) if name in order else len(order))
+
+    return rows, columns, varying
+
+
+def plot_success(path, x_key=None, panel_key=None, save=False):
+    """Plot the sweep's success metric against whichever parameters it varied.
+
+    x_key goes on the x axis and panel_key gets one panel per value, shaded by
+    that value. Both default to the axes the csv shows varying, so a sweep over
+    any pair of parameters plots without arguments. The panels share x and y
+    limits, so a panel is readable alone and still comparable to its neighbours.
+    """
+    rows, columns, varying = read_sweep_csv(path)
+
+    x_key = resolve(x_key).name if x_key else (varying[0] if varying else None)
+
+    if x_key is None:
+        raise SystemExit(f"nothing varies in {path}; there is no axis to plot")
+
+    if panel_key:
+        panel_key = resolve(panel_key).name
+    else:
+        panel_key = next((name for name in varying if name != x_key), None)
+
+    # a third axis can't be drawn here, and averaging it into the same line
+    # silently would be worse than saying so
+    hidden = [name for name in varying if name not in (x_key, panel_key)]
+
+    if hidden:
+        print(
+            f"warning: {', '.join(hidden)} also varies and is not on this plot; "
+            f"each point shown is one arbitrary run. Pass -x/-p to choose the "
+            f"axes, or filter the csv first."
+        )
+
+    x_param = BY_NAME[x_key]
+
+    def numeric(name, row):
+        return float(BY_NAME[name].parse(row[name]))
+
+    xs_all = sorted({numeric(x_key, row) for row in rows})
+    # a single-parameter sweep is just the one panel
+    panel_values = (
+        sorted({numeric(panel_key, row) for row in rows}) if panel_key else [None]
+    )
     success = {
-        (float(row["effort_weight"]), float(row["train_horizon"])): float(
+        (numeric(x_key, row), numeric(panel_key, row) if panel_key else None): float(
             row["success"]
         )
         for row in rows
     }
 
-    def series_for(train_horizon):
-        xs = [weight for weight in effort_weights if (weight, train_horizon) in success]
+    def series_for(panel_value):
+        xs = [x for x in xs_all if (x, panel_value) in success]
 
-        return xs, [success[(weight, train_horizon)] for weight in xs]
+        return xs, [success[(x, panel_value)] for x in xs]
 
-    norm = plt.Normalize(min(train_horizons), max(train_horizons))
+    def panel_label(value):
+        return BY_NAME[panel_key].show(BY_NAME[panel_key].parse(value))
+
+    # one panel has nothing to shade against, and Normalize(v, v) divides by zero
+    norm = (
+        plt.Normalize(min(panel_values), max(panel_values))
+        if panel_key and len(panel_values) > 1
+        else None
+    )
     cmap = plt.colormaps["viridis"]
 
-    n_cols = min(4, len(train_horizons))
-    n_rows = -(-len(train_horizons) // n_cols)
+    n_cols = min(4, len(panel_values))
+    n_rows = -(-len(panel_values) // n_cols)
 
     fig, axes = plt.subplots(
         n_rows,
@@ -393,59 +481,61 @@ def plot_success_vs_lambda(path, save=False):
     )
     panels = np.atleast_1d(axes).ravel()
 
-    for ax, train_horizon in zip(panels, train_horizons):
-        # the other windows in grey give each panel back the context it loses
-
+    for ax, panel_value in zip(panels, panel_values):
         ax.plot(
-            *series_for(train_horizon),
-            color=cmap(norm(train_horizon)),
+            *series_for(panel_value),
+            color=cmap(norm(panel_value)) if norm else cmap(0.5),
             linewidth=1.8,
             marker="o",
             markersize=4,
         )
 
-        ax.set_title(f"train_horizon = {train_horizon}", fontsize=10)
+        if panel_key:
+            ax.set_title(f"{panel_key} = {panel_label(panel_value)}", fontsize=10)
+
         ax.set_ylim(-0.03, 1.05)
         ax.grid(alpha=0.25, linewidth=0.6)
 
-    for ax in panels[len(train_horizons) :]:
+    for ax in panels[len(panel_values) :]:
         ax.set_visible(False)
 
     # sharex hides tick labels everywhere but the bottom row, so the panels in
     # a column that the grid leaves short would otherwise lose their x axis
     for column in range(n_cols):
-        column_panels = [i for i in range(column, len(train_horizons), n_cols)]
+        column_panels = [i for i in range(column, len(panel_values), n_cols)]
         if column_panels:
             panels[column_panels[-1]].tick_params(labelbottom=True)
 
-    fig.supxlabel("λ (control-effort penalty)", y=0.03)
+    fig.supxlabel(x_param.label, y=0.03)
     fig.supylabel("success (fraction of time x > 0)")
-    fig.suptitle("Success vs. regularizer strength, by training window")
 
-    for train_horizon in train_horizons:
-        xs, ys = series_for(train_horizon)
-        print(
-            f"train_horizon={train_horizon}: best success {max(ys):.4f} "
-            f"at effort_weight={xs[ys.index(max(ys))]}"
-        )
+    title = f"Success vs. {x_param.label}"
 
+    if panel_key:
+        title += f", by {BY_NAME[panel_key].label}"
+
+    fig.suptitle(title)
+
+    for panel_value in panel_values:
+        xs, ys = series_for(panel_value)
+        where = "" if panel_key is None else f"{panel_key}={panel_label(panel_value)}: "
+        print(f"{where}best success {max(ys):.4f} at {x_key}={xs[ys.index(max(ys))]}")
+
+    # everything the grid held fixed, read back through the registry so a
+    # boolean column reads 'on' rather than '1'
     settings = rows[0]
-    caption = settings_caption(
-        learning_rate=settings["learning_rate"],
-        iters=settings["iters"],
-        plot_horizon=settings["plot_horizon"],
-        dt=DT,
-        penalize_effort="on" if settings["penalize_effort"] == "1" else "off",
-        rk4="on" if settings["rk4"] == "1" else "off",
-        runs=len(rows),
-    )
+    constant = {
+        name: BY_NAME[name].show(BY_NAME[name].parse(settings[name]))
+        for name in columns
+        if name not in varying
+    }
 
     fig.tight_layout(rect=(0, 0.055, 1, 1))
-    add_caption(fig, caption)
+    add_caption(fig, settings_caption(**constant, dt=DT, runs=len(rows)))
 
     if save:
-        out = os.path.join(os.path.dirname(path), "success_v_lambda.png")
-        os.makedirs(os.path.dirname(out), exist_ok=True)
+        out = os.path.join(os.path.dirname(path), f"success_v_{x_param.key}.png")
+        os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
         plt.savefig(out, dpi=150, bbox_inches="tight")
         print(f"Saved to {out}")
     else:
@@ -466,6 +556,7 @@ def plot_run_summary(
     traj=None,
     u=None,
     out_dir=None,
+    name_keys=None,
 ):
     # a caller that batched the rollout already holds the trajectory, and
     # re-integrating it one lambda at a time would undo the point of batching
@@ -479,18 +570,17 @@ def plot_run_summary(
     # sweep.py scrapes this line, so keep the prefix stable
     print(f"success (fraction of time x > 0): {success:.6f}")
 
-    caption = settings_caption(
-        initial_condition=f"({','.join(str(v) for v in state0)})",
+    values = run_values(
+        initial_condition=tuple(state0),
         learning_rate=lr,
         train_horizon=train_horizon,
         plot_horizon=plot_horizon,
         iters=iters,
         effort_weight=effort_weight,
-        dt=DT,
-        penalize_effort="on" if penalize_effort else "off",
-        rk4="on" if integrator is rk4_step else "off",
-        success=f"{success:.3f}",
+        penalize_effort=penalize_effort,
+        rk4=integrator is rk4_step,
     )
+    caption = settings_caption(**shown(values), dt=DT, success=f"{success:.3f}")
 
     fig = plt.figure(figsize=(15, 7))
     gs = fig.add_gridspec(2, 2, width_ratios=(1.1, 1))
@@ -507,22 +597,11 @@ def plot_run_summary(
     add_caption(fig, caption)
 
     if save:
-        path = os.path.join(run_output_dir(iters, out_dir), "attractor")
-        filename = f"lambda{effort_weight}_{train_horizon}"
-
-        if penalize_effort:
-            filename += "_regularized"
-        else:
-            filename += "_unregularized"
-
-        if integrator == rk4_step:
-            filename += "_rk4"
-
-        os.makedirs(path, exist_ok=True)
-        out = os.path.join(path, filename + ".png")
-        plt.savefig(out, dpi=150, bbox_inches="tight")
-        print(f"Saved to {out}")
-        # a sweep stays in one process, so an unclosed figure per grid point piles up
-        plt.close(fig)
+        save_figure(
+            fig,
+            os.path.join(run_output_dir(iters, out_dir), "attractor"),
+            values,
+            name_keys or SWEEPABLE,
+        )
     else:
         plt.show()

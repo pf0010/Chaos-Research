@@ -14,7 +14,8 @@ import argparse
 
 from figures import plot_loss_curve, plot_loss_gradient_vs_horizon, plot_run_summary
 from lorenz import euler_step, rk4_step
-from training import DEFAULT_EFFORT_WEIGHT, train_policy
+from params import DEFAULT_EFFORT_WEIGHT, SWEEPABLE, resolve
+from training import train_policy
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
@@ -38,8 +39,17 @@ if __name__ == "__main__":
         "-o",
         "--out_dir",
         default=None,
-        help="where -s writes (default: ./plots/loss_sweep_<iters>); sweep.py "
+        help="where -s writes (default: ./plots/run_iters<iters>); sweep.py "
         "points every grid point at its own sweep directory",
+    )
+    parser.add_argument(
+        "-nk",
+        "--name_keys",
+        default=None,
+        metavar="NAMES",
+        help="comma-separated parameters to put in the saved filename "
+        "(default: all of them); sweep.py passes the axes it varied, so the "
+        "constants stay in the sweep manifest instead of in every name",
     )
 
     flags = parser.add_argument_group(title="Flags")
@@ -50,6 +60,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     integrator = rk4_step if args.rk4 else euler_step
+    name_keys = (
+        [resolve(name).name for name in args.name_keys.split(",") if name.strip()]
+        if args.name_keys is not None
+        else SWEEPABLE
+    )
 
     if args.loss_gradient_horizon:
         plot_loss_gradient_vs_horizon(
@@ -76,12 +91,14 @@ if __name__ == "__main__":
                 state0=args.initial_condition,
                 lr=args.learning_rate,
                 train_horizon=args.train_horizon,
+                plot_horizon=args.plot_horizon,
                 iters=args.iters,
                 penalize_effort=args.penalize_effort,
                 effort_weight=args.effort_weight,
                 integrator=integrator,
                 save=args.save,
                 out_dir=args.out_dir,
+                name_keys=name_keys,
             )
 
         plot_run_summary(
@@ -96,4 +113,5 @@ if __name__ == "__main__":
             effort_weight=args.effort_weight,
             integrator=integrator,
             out_dir=args.out_dir,
+            name_keys=name_keys,
         )

@@ -9,10 +9,10 @@ import numpy as np
 import torch
 
 from lorenz import DT, LYAPUNOV_EXP, euler_step, rollout_torch
+from params import DEFAULT_EFFORT_WEIGHT
 
 SOFTNESS = 2.0
 U_REF = 60.0
-DEFAULT_EFFORT_WEIGHT = 0.07
 
 
 def init_policy_params():
