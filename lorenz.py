@@ -17,16 +17,19 @@ LYAPUNOV_EXP = 0.9056
 
 
 def lorenz_rhs(state, u=0.0):
-    x, y, z = state[0], state[1], state[2]
+    # indexed on the last axis and stacked back onto it, so a single (3,) state
+    # and a batch of them (B, 3) go through unchanged -- that is what lets one
+    # rollout cover a whole sweep grid. `u` is then a scalar or a (B,) vector.
+    x, y, z = state[..., 0], state[..., 1], state[..., 2]
 
     dx = PRANDTL * (y - x) + u
     dy = x * (RAYLEIGH - z) - y
     dz = x * y - BETA * z
 
     if isinstance(state, torch.Tensor):
-        return torch.stack((dx, dy, dz))
+        return torch.stack((dx, dy, dz), dim=-1)
 
-    return np.array((dx, dy, dz))
+    return np.stack((dx, dy, dz), axis=-1)
 
 
 def eval_control(control, state):
@@ -76,7 +79,16 @@ def rollout_numpy(state0, steps=DEFAULT_STEPS, u=0.0, integrator=euler_step):
 
 
 def rollout_torch(state0, control, steps=DEFAULT_STEPS, integrator=euler_step):
-    state = torch.as_tensor(state0, dtype=torch.float64)
+    """Time-first: (steps+1, 3), or (steps+1, B, 3) if `state0` is a batch.
+
+    A tensor `state0` is taken as it is, so the caller picks the device and the
+    precision; anything else keeps the float64 CPU default the scalar runs use.
+    """
+    state = (
+        state0
+        if isinstance(state0, torch.Tensor)
+        else torch.as_tensor(state0, dtype=torch.float64)
+    )
 
     traj = [state]
 
@@ -86,3 +98,32 @@ def rollout_torch(state0, control, steps=DEFAULT_STEPS, integrator=euler_step):
         traj.append(state)
 
     return torch.stack(traj)
+
+
+def rollout_numpy_batched(state0, w, b, steps=DEFAULT_STEPS, integrator=euler_step):
+    """Closed-loop rollout of B policies at once: traj (steps+1, B, 3), u (steps+1, B).
+
+    Nothing here is differentiated -- this is the evaluation trajectory the
+    figures and the success metric are read off -- so it stays in numpy, where
+    a step on a (B, 3) array costs a fraction of the same step as torch ops.
+    """
+    w = np.asarray(w, dtype=float)
+    b = np.asarray(b, dtype=float)
+    state = np.broadcast_to(np.asarray(state0, dtype=float), w.shape).copy()
+
+    def control(states):
+        return (states * w).sum(-1) + b
+
+    traj = np.empty((steps + 1, *w.shape))
+    controls = np.empty((steps + 1, w.shape[0]))
+
+    traj[0] = state
+    controls[0] = control(state)
+
+    for t in range(steps):
+        state, _ = integrator(state, control)
+
+        traj[t + 1] = state
+        controls[t + 1] = control(state)
+
+    return traj, controls

@@ -1,16 +1,23 @@
-"""Sweep run_control.py over a grid of any run parameters.
+"""Sweep the controller over a grid of any run parameters.
 
-Each grid point runs as its own run_control.py subprocess, so the sweep is
-parallelized simply by running several of them at once.
+The grid is trained in batches, not one point at a time: λ and the learning
+rate ride along a leading batch axis, so a whole row of the grid costs one set
+of kernels rather than one set each. Everything that would change the shape of
+the computation -- the window length, the integrator, the iteration count --
+splits the grid into groups that are trained one after another (params.py marks
+which is which). On a GPU the batch is close to free: a group of 11 costs about
+what a group of 1 does, because the cost is kernel launches and there are the
+same number either way. See kernels.py.
 
     python sweep.py                             # the default lambda x window grid
     python sweep.py -sw lr=0.01:0.1:0.01        # sweep the learning rate instead
     python sweep.py -sw lam=0.05:0.15:0.01 -sw th=1:2:0.25 -sw rk4=0,1
-    python sweep.py -j 4                        # cap at 4 concurrent runs
+    python sweep.py -j 4                        # cap at 4 figure-drawing workers
     python sweep.py -loss                       # also save a loss curve per point
     python sweep.py -np                         # skip the success plot at the end
     python sweep.py -sc                         # just replot the latest sweep
-    python sweep.py --dry-run                   # print the commands, run nothing
+    python sweep.py --device cpu                # or --fp64, or --no-graph
+    python sweep.py --dry-run                   # print the plan, run nothing
 
 An axis is NAME=start:stop:step (inclusive of stop) or NAME=v1,v2,v3, where
 NAME is any sweepable parameter in params.py, by canonical name or short key.
@@ -38,17 +45,24 @@ import glob
 import itertools
 import json
 import os
-import re
 import subprocess
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timezone
 
-from params import PARAMS, SWEEPABLE, csv_value, defaults, parse_axis, resolve, stem
+from params import (
+    PARAMS,
+    SHAPING,
+    SWEEPABLE,
+    csv_value,
+    defaults,
+    parse_axis,
+    resolve,
+    stem,
+)
 
-SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_control.py")
-SUCCESS_RE = re.compile(r"success \(fraction of time x > 0\): ([0-9.]+)")
+HERE = os.path.dirname(os.path.abspath(__file__))
 
 SWEEP_ROOT = "./plots"
 COUNTER = os.path.join(SWEEP_ROOT, ".sweep_counter")
@@ -109,7 +123,7 @@ def git_sha():
     try:
         return subprocess.run(
             ["git", "rev-parse", "HEAD"],
-            cwd=os.path.dirname(SCRIPT),
+            cwd=HERE,
             capture_output=True,
             text=True,
             check=True,
@@ -167,44 +181,103 @@ def build_base(args, axes):
     return base
 
 
-def build_command(values, sweep_dir, name_keys, loss_curve):
-    cmd = [
-        sys.executable,
-        SCRIPT,
-        "-o",
-        sweep_dir,
-        "-nk",
-        ",".join(name_keys),
-        "-s",
-    ]
+def group_grid(grid):
+    """Split the grid into batches that can train together.
 
-    for param in PARAMS:
-        value = values[param.name]
+    A group is a set of points agreeing on everything except the parameters
+    params.py marks batchable, so within a group only per-element numbers
+    differ and one run of the training loop covers all of them.
+    """
+    groups = {}
 
-        if param.store_true:
-            if value:
-                cmd.append(param.flag)
-        elif param.nargs > 1:
-            cmd += [param.flag, *(str(component) for component in value)]
-        else:
-            cmd += [param.flag, str(value)]
+    for values in grid:
+        key = tuple(csv_value(name, values[name]) for name in SHAPING)
+        groups.setdefault(key, []).append(values)
 
-    if loss_curve:
-        cmd.append("-loss")
-
-    return cmd
+    return list(groups.values())
 
 
-def run(cmd, env):
-    start = time.monotonic()
-    proc = subprocess.run(cmd, env=env, capture_output=True, text=True)
-    return proc, time.monotonic() - start
+def train_group(group, device, dtype, use_graph):
+    """Train one batch and evaluate it, returning (w, b, history, traj, u, success).
+
+    The evaluation rollout is batched too, and it is the one the figures and
+    the success metric are read off, so every point in the group is measured
+    on exactly the trajectory that is drawn for it.
+    """
+    # imported here so --dry-run and -sc don't pay for torch and matplotlib
+    from lorenz import DT, LYAPUNOV_EXP, euler_step, rk4_step, rollout_numpy_batched
+    from training import success_fraction, train_policy_batched
+
+    settings = group[0]
+    integrator = rk4_step if settings["rk4"] else euler_step
+
+    w, b, history = train_policy_batched(
+        state0=settings["initial_condition"],
+        batch=len(group),
+        horizon=settings["train_horizon"],
+        effort_horizon=settings["plot_horizon"],
+        iters=settings["iters"],
+        learning_rate=[values["learning_rate"] for values in group],
+        effort_weight=[values["effort_weight"] for values in group],
+        penalize_effort=settings["penalize_effort"],
+        integrator=integrator,
+        device=device,
+        dtype=dtype,
+        use_graph=use_graph,
+    )
+
+    w = w.cpu().double().numpy()
+    b = b.cpu().double().numpy()
+
+    steps = round(settings["plot_horizon"] / (LYAPUNOV_EXP * DT))
+    traj, u = rollout_numpy_batched(
+        settings["initial_condition"], w, b, steps=steps, integrator=integrator
+    )
+
+    return w, b, history, traj, u, success_fraction(traj)
 
 
-def parse_success(stdout):
-    match = SUCCESS_RE.search(stdout)
+def draw_point(job):
+    """One grid point's figures, in a worker process. Returns its filename stem."""
+    import contextlib
+    import io
 
-    return float(match.group(1)) if match else None
+    from figures import plot_loss_curve, plot_run_summary
+
+    values, w, b, history, traj, u, sweep_dir, name_keys, loss_curve = job
+
+    import torch
+
+    params = (torch.as_tensor(w), torch.as_tensor(b))
+    shared = dict(
+        state0=values["initial_condition"],
+        lr=values["learning_rate"],
+        train_horizon=values["train_horizon"],
+        plot_horizon=values["plot_horizon"],
+        iters=values["iters"],
+        penalize_effort=values["penalize_effort"],
+        effort_weight=values["effort_weight"],
+        integrator=rk4_step_if(values["rk4"]),
+        save=True,
+        out_dir=sweep_dir,
+        name_keys=name_keys,
+    )
+
+    # the plotters narrate to stdout, which from 100 workers is noise; the
+    # caller prints one line per point instead
+    with contextlib.redirect_stdout(io.StringIO()):
+        if loss_curve:
+            plot_loss_curve(history, **shared)
+
+        plot_run_summary(params, traj=traj, u=u, **shared)
+
+    return stem(values, name_keys)
+
+
+def rk4_step_if(flag):
+    from lorenz import euler_step, rk4_step
+
+    return rk4_step if flag else euler_step
 
 
 def write_csv(path, rows, axis_names):
@@ -234,7 +307,7 @@ def write_csv(path, rows, axis_names):
     print(f"wrote {len(rows)} rows to {path}")
 
 
-def write_manifest(path, axes, base, name_keys, args, grid_size):
+def write_manifest(path, axes, base, name_keys, args, grid_size, runtime):
     """Everything the filenames deliberately leave out."""
     constant = {
         name: csv_value(name, value)
@@ -254,6 +327,9 @@ def write_manifest(path, axes, base, name_keys, args, grid_size):
                 "constant": constant,
                 "grid_points": grid_size,
                 "jobs": args.jobs,
+                # the device and the precision don't name a file, but they do
+                # move the last digits of a result, so the sweep records them
+                **runtime,
             },
             f,
             indent=2,
@@ -281,11 +357,32 @@ if __name__ == "__main__":
         "--jobs",
         type=int,
         default=os.cpu_count(),
-        help="max concurrent run_control.py runs (default: all cores)",
+        help="max concurrent figure-drawing workers (default: all cores). The "
+        "training itself is batched, not forked, so this no longer sets it",
+    )
+    parser.add_argument(
+        "--device",
+        default="auto",
+        choices=("auto", "cpu", "cuda"),
+        help="where the training runs (default: cuda when there is one)",
+    )
+    parser.add_argument(
+        "--fp64",
+        action="store_true",
+        help="force float64. The default is float32 on the GPU, where fp64 is "
+        "1/64 rate and buys less accuracy than the attractor already destroys",
+    )
+    parser.add_argument(
+        "--no_graph",
+        "--no-graph",
+        dest="no_graph",
+        action="store_true",
+        help="skip CUDA graph capture (it is what makes the launch overhead go "
+        "away; turn it off to compare, or if capture upsets a driver)",
     )
 
-    # passed straight through to run_control.py; None means "leave at default",
-    # which is what lets a clash with a swept axis be caught
+    # None means "leave at default", which is what lets a clash with a swept
+    # axis be caught
     parser.add_argument(
         "-ic",
         "--initial_condition",
@@ -379,7 +476,14 @@ if __name__ == "__main__":
     for name, values in axes.items():
         print(f"{name}: {values}")
 
-    print(f"{len(grid)} runs, {args.jobs} at a time")
+    groups = group_grid(grid)
+    batched_over = [name for name in axis_names if name not in SHAPING]
+
+    print(
+        f"{len(grid)} runs in {len(groups)} batched group(s) of up to "
+        f"{max(len(g) for g in groups)}"
+        + (f", batching over {', '.join(batched_over)}" if batched_over else "")
+    )
     print(f"naming by: {', '.join(name_keys)}")
 
     # the axes decide the names, so a name can only collide if a formatter is
@@ -394,23 +498,36 @@ if __name__ == "__main__":
         )
 
     if args.dry_run:
-        # a dry run claims no number, so the directory here is a placeholder
-        for values in grid:
-            print(
-                " ".join(
-                    build_command(
-                        values,
-                        f"{SWEEP_ROOT}/sweep_NNN",
-                        name_keys,
-                        args.loss_curve,
-                    )
-                )
-            )
+        for n, group in enumerate(groups, start=1):
+            held = {
+                name: group[0][name] for name in SHAPING if name in axis_names
+            }
+            varies = {
+                name: [values[name] for values in group] for name in batched_over
+            }
+            print(f"group {n}: {len(group)} point(s)  {held}  batched {varies}")
         sys.exit(0)
+
+    # matplotlib must not reach for a GUI backend, and the drawing workers are
+    # forked from here, so this has to be set before figures is ever imported
+    os.environ.setdefault("MPLBACKEND", "Agg")
 
     sweep_dir = claim_sweep_dir()
     csv_path = args.csv or os.path.join(sweep_dir, "success.csv")
     print(f"writing to {sweep_dir}")
+
+    from kernels import default_dtype, resolve_device
+
+    device = resolve_device(args.device)
+    import torch
+
+    dtype = torch.float64 if args.fp64 else default_dtype(device)
+    use_graph = not args.no_graph
+
+    print(
+        f"training on {device} in {str(dtype).split('.')[-1]}"
+        + (", CUDA graph captured" if use_graph and device == "cuda" else "")
+    )
 
     write_manifest(
         os.path.join(sweep_dir, "manifest.json"),
@@ -419,64 +536,62 @@ if __name__ == "__main__":
         name_keys,
         args,
         len(grid),
+        {
+            "device": device,
+            "dtype": str(dtype).split(".")[-1],
+            "cuda_graph": use_graph and device == "cuda",
+        },
     )
 
-    # each run is single-threaded so the workers don't oversubscribe the CPU,
-    # and Agg keeps matplotlib from reaching for a GUI backend
-    env = {
-        **os.environ,
-        "MPLBACKEND": "Agg",
-        "OMP_NUM_THREADS": "1",
-        "MKL_NUM_THREADS": "1",
-    }
-
-    failures = []
     rows = []
+    jobs = []
     started = time.monotonic()
 
-    with ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        futures = {
-            pool.submit(
-                run,
-                build_command(values, sweep_dir, name_keys, args.loss_curve),
-                env,
-            ): values
-            for values in grid
-        }
+    for n, group in enumerate(groups, start=1):
+        at = time.monotonic()
+        w, b, history, traj, u, success = train_group(group, device, dtype, use_graph)
+        elapsed = time.monotonic() - at
 
-        for done, future in enumerate(as_completed(futures), start=1):
-            values = futures[future]
-            proc, elapsed = future.result()
-            status = "ok " if proc.returncode == 0 else "FAIL"
-            success = parse_success(proc.stdout) if proc.returncode == 0 else None
-            rows.append((values, success))
-            where = "  ".join(f"{name}={values[name]}" for name in axis_names)
+        held = "  ".join(
+            f"{name}={group[0][name]}" for name in SHAPING if name in axis_names
+        )
+        print(
+            f"[group {n}/{len(groups)}] {len(group)} point(s)  {held}  "
+            f"{elapsed:.1f}s  success {success.min():.4f}-{success.max():.4f}",
+            flush=True,
+        )
 
-            print(
-                f"[{done}/{len(grid)}] {status} {where}  {elapsed:.1f}s"
-                f"  success={'--' if success is None else f'{success:.4f}'}",
-                flush=True,
+        for i, values in enumerate(group):
+            rows.append((values, float(success[i])))
+            jobs.append(
+                (
+                    values,
+                    w[i],
+                    b[i],
+                    history[:, i, :],
+                    traj[:, i, :],
+                    u[:, i],
+                    sweep_dir,
+                    name_keys,
+                    args.loss_curve,
+                )
             )
 
-            if proc.returncode != 0:
-                failures.append((where, proc.stderr.strip()))
+    trained = time.monotonic() - started
+    print(f"\ntrained {len(grid)} points in {trained:.1f}s")
 
-    print(f"\nfinished in {time.monotonic() - started:.1f}s")
+    # drawing is the serial part now, so it gets the cores the training used to
+    with ProcessPoolExecutor(max_workers=args.jobs) as pool:
+        futures = [pool.submit(draw_point, job) for job in jobs]
+
+        for done, future in enumerate(as_completed(futures), start=1):
+            print(f"[{done}/{len(jobs)}] drew {future.result()}", flush=True)
+
+    print(f"finished in {time.monotonic() - started:.1f}s")
 
     write_csv(csv_path, rows, axis_names)
 
     # a finished sweep is usually headless, so write the figure rather than
-    # blocking on a window nobody is watching. an all-failed grid has nothing to
-    # plot, and raising over it would bury the failure report below.
-    if not args.no_plot and any(success is not None for _, success in rows):
+    # blocking on a window nobody is watching
+    if not args.no_plot:
         plot_csv(csv_path, save=True, x_key=args.x_key, panel_key=args.panel_key)
-
-    missing = [values for values, success in rows if success is None]
-
-    if missing:
-        print(f"{len(missing)} of {len(rows)} runs reported no success rate")
-
-    for where, stderr in failures:
-        print(f"\n{where} failed:\n{stderr}")
-
-    sys.exit(1 if failures else 0)

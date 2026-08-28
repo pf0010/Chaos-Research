@@ -70,6 +70,11 @@ class Param:
     sweepable: bool = True
     store_true: bool = False  # set by the flag's presence, not by a value
     nargs: int = 1
+    # whether a sweep can vary this *within* one batched training run. Only a
+    # parameter that leaves the shape of the computation alone can: it rides
+    # along as a per-element tensor. Anything that changes the step count or
+    # the integrator splits the grid into separate runs instead.
+    batchable: bool = False
 
 
 PARAMS = (
@@ -93,6 +98,7 @@ PARAMS = (
         0.05,
         float,
         _decimal(4),
+        batchable=True,
     ),
     Param(
         "train_horizon",
@@ -129,6 +135,7 @@ PARAMS = (
         DEFAULT_EFFORT_WEIGHT,
         float,
         _decimal(3),
+        batchable=True,
     ),
     Param(
         "penalize_effort",
@@ -157,6 +164,9 @@ PARAMS = (
 BY_NAME = {param.name: param for param in PARAMS}
 BY_KEY = {param.key: param for param in PARAMS}
 SWEEPABLE = [param.name for param in PARAMS if param.sweepable]
+BATCHABLE = [param.name for param in PARAMS if param.batchable]
+# what a batched run has to hold fixed, and so what sweep.py groups the grid by
+SHAPING = [param.name for param in PARAMS if not param.batchable]
 
 
 def resolve(name):

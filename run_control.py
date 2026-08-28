@@ -6,8 +6,10 @@
 
 Plotting a finished sweep is sweep.py's job: `python sweep.py -sc`.
 
-sweep.py drives this module over a grid, so the success line plot_run_summary
-prints and the short flags below are both part of its interface.
+This is the single-run door: one policy, trained as a batch of one. A grid no
+longer comes through here -- sweep.py calls the batched trainer directly, since
+running the points as separate processes is exactly what made a sweep slow.
+The two share params.py, so a flag added below should be added there too.
 """
 
 import argparse
@@ -52,8 +54,23 @@ if __name__ == "__main__":
         "constants stay in the sweep manifest instead of in every name",
     )
 
+    parser.add_argument(
+        "--device",
+        default="auto",
+        choices=("auto", "cpu", "cuda"),
+        help="where the training runs (default: cuda when there is one)",
+    )
+
     flags = parser.add_argument_group(title="Flags")
     flags.add_argument("-s", "--save", action="store_true")
+    flags.add_argument(
+        "--fp64",
+        action="store_true",
+        help="force float64; the GPU default is float32 (see kernels.py)",
+    )
+    flags.add_argument(
+        "--no_graph", "--no-graph", dest="no_graph", action="store_true"
+    )
     flags.add_argument("-pe", "--penalize_effort", action="store_true")
     flags.add_argument("-rk4", "--rk4", action="store_true")
     flags.add_argument("-loss", "--loss_curve", action="store_true")
@@ -73,6 +90,8 @@ if __name__ == "__main__":
             integrator=integrator,
         )
     else:
+        import torch
+
         history = []
         params = train_policy(
             state0=args.initial_condition,
@@ -84,6 +103,9 @@ if __name__ == "__main__":
             effort_weight=args.effort_weight,
             integrator=integrator,
             history=history,
+            device=args.device,
+            dtype=torch.float64 if args.fp64 else None,
+            use_graph=not args.no_graph,
         )
 
         if args.loss_curve:

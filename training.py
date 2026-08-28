@@ -3,11 +3,18 @@
 The policy is a linear feedback law u = w·s + b, trained by differentiating
 straight through the integrator, so the training window is limited by how far
 the gradient survives the attractor's exponential stretching.
+
+Everything here carries an optional leading batch axis: w is (B, 3), b is (B,),
+and the objectives reduce over time only, returning one number per policy. B
+independent policies then train in one set of kernels instead of B sets, which
+is what makes a sweep worth putting on a GPU at all -- see kernels.py for why
+a single 3-component state emphatically is not.
 """
 
 import numpy as np
 import torch
 
+from kernels import default_dtype, moment_stats, resolve_device
 from lorenz import DT, LYAPUNOV_EXP, euler_step, rollout_torch
 from params import DEFAULT_EFFORT_WEIGHT
 
@@ -15,16 +22,21 @@ SOFTNESS = 2.0
 U_REF = 60.0
 
 
-def init_policy_params():
-    w = torch.zeros(3, dtype=torch.float64, requires_grad=True)
-    b = torch.zeros((), dtype=torch.float64, requires_grad=True)
+def init_policy_params(batch=None, device="cpu", dtype=torch.float64):
+    shape = () if batch is None else (batch,)
+
+    w = torch.zeros((*shape, 3), dtype=dtype, device=device, requires_grad=True)
+    b = torch.zeros(shape, dtype=dtype, device=device, requires_grad=True)
 
     return w, b
 
 
 def linear_policy(params, state):
     w, b = params
-    return torch.dot(w, state) + b
+
+    # not torch.dot, so that a (B, 3) batch of laws applies to a (B, 3) batch
+    # of states in the same expression a single law applies to a single state
+    return (w * state).sum(-1) + b
 
 
 def final_state_sensitivity(state0, u_tensor, horizon=1.0, coord=0):
@@ -43,29 +55,30 @@ def soft_step(x, softness=SOFTNESS):
 
 
 def task_loss(traj, softness=SOFTNESS):
-    x = traj[:, 0]
+    # mean over the time axis only: a scalar for one policy, (B,) for a batch
+    x = traj[..., 0]
 
-    return (1 - soft_step(x, softness)).mean()
+    return (1 - soft_step(x, softness)).mean(0)
 
 
 def success_fraction(traj):
     # hard counterpart of task_loss: no tanh softening, so this is the
     # metric we actually care about rather than the one we differentiate
-    x = traj[:, 0]
+    x = traj[..., 0]
 
     if isinstance(x, torch.Tensor):
-        return (x > 0).to(torch.float64).mean().item()
+        return (x > 0).to(torch.float64).mean(0)
 
-    return float((x > 0).mean())
+    return (x > 0).mean(0)
 
 
 def effort_penalty(traj, params, u_ref=U_REF):
     w, b = params
 
     # the control at the final state is never applied, so drop it
-    u = traj[:-1] @ w + b
+    u = (traj[:-1] * w).sum(-1) + b
 
-    return (u / u_ref).pow(2).mean()
+    return (u / u_ref).pow(2).mean(0)
 
 
 def effort_moments(state0, params, steps, integrator=euler_step):
@@ -73,28 +86,13 @@ def effort_moments(state0, params, steps, integrator=euler_step):
 
     The penalty is quadratic in the policy, so these two moments are the whole
     of what it needs from the trajectory -- nothing else about the states
-    survives into the loss. That lets the rollout run in numpy, which is a few
-    times cheaper than integrating the same steps as a torch graph, and keeps
-    the memory flat in `steps` instead of storing every state.
+    survives into the loss. That lets the rollout leave the autograd graph
+    entirely, and keeps the memory flat in `steps` instead of storing every
+    state. kernels.py picks where it actually runs.
     """
-    w, b = (param.detach().numpy() for param in params)
+    w, b = params
 
-    def control(state):
-        return float(w @ state + b)
-
-    state = np.array(state0, dtype=float)
-    m = np.zeros(3)
-    M = np.zeros((3, 3))
-
-    for _ in range(steps):
-        # accumulating before the step drops the final state, which is what
-        # effort_penalty's traj[:-1] does and for the same reason
-        m += state
-        M += np.outer(state, state)
-
-        state, _ = integrator(state, control)
-
-    return M / steps, m / steps
+    return moment_stats(state0, w.detach(), b.detach(), steps, integrator)
 
 
 def effort_from_moments(moments, params, u_ref=U_REF):
@@ -104,10 +102,216 @@ def effort_from_moments(moments, params, u_ref=U_REF):
     moments came from, since w and b are the only things it differentiates
     through -- the states are frozen either way.
     """
-    M, m = (torch.as_tensor(moment) for moment in moments)
+    M, m = (
+        moment
+        if isinstance(moment, torch.Tensor)
+        else torch.as_tensor(moment, dtype=params[0].dtype, device=params[0].device)
+        for moment in moments
+    )
     w, b = params
 
-    return (w @ M @ w + 2 * b * (m @ w) + b * b) / u_ref**2
+    # batched matmul on the last two axes, so this is wᵀMw for one policy and
+    # a (B,) vector of them for a batch
+    quadratic = (w.unsqueeze(-2) @ M @ w.unsqueeze(-1)).squeeze(-1).squeeze(-1)
+    cross = (m * w).sum(-1)
+
+    return (quadratic + 2 * b * cross + b * b) / u_ref**2
+
+
+class BatchedAdam:
+    """Adam with a per-element learning rate and a device-side step counter.
+
+    Two departures from torch.optim.Adam, both needed here. The learning rate
+    is a tensor, so `learning_rate` can be one of the axes a sweep batches over
+    rather than something that forces a separate run. And the step count lives
+    on the device, so the bias correction is an ordinary tensor op and the
+    whole update can be captured into a CUDA graph. The arithmetic is otherwise
+    exactly Adam's, and `test_batched_adam` pins it to torch's to 1e-15.
+    """
+
+    def __init__(self, params, lrs, betas=(0.9, 0.999), eps=1e-8):
+        self.params = list(params)
+        self.lrs = list(lrs)
+        self.beta1, self.beta2 = betas
+        self.eps = eps
+        self.avg = [torch.zeros_like(p) for p in self.params]
+        self.avg_sq = [torch.zeros_like(p) for p in self.params]
+
+    def reset(self):
+        """Zero the moments in place, keeping tensor identity for the graph."""
+        for state in (self.avg, self.avg_sq):
+            for tensor in state:
+                tensor.zero_()
+
+        self.zero_grad()
+
+    def zero_grad(self):
+        for p in self.params:
+            if p.grad is not None:
+                p.grad.zero_()
+
+    @torch.no_grad()
+    def step(self, t):
+        # t is a 1-based device tensor, not a python int, so that b**t stays a
+        # recordable op instead of a host-side value baked in at capture time.
+        # It has to be cast first: an integer exponent would send the power to
+        # float32 by promotion, and 1 - 0.999 evaluated there is wrong in the
+        # fifth digit, which is enough to move the update by ~1e-5 relative.
+        t = t.to(self.avg[0].dtype)
+
+        correction1 = 1 - self.beta1**t
+        correction2 = 1 - self.beta2**t
+
+        for p, lr, avg, avg_sq in zip(self.params, self.lrs, self.avg, self.avg_sq):
+            avg.mul_(self.beta1).add_(p.grad, alpha=1 - self.beta1)
+            avg_sq.mul_(self.beta2).addcmul_(p.grad, p.grad, value=1 - self.beta2)
+
+            denom = (avg_sq / correction2).sqrt().add_(self.eps)
+            p.sub_(lr * (avg / correction1) / denom)
+
+
+def _as_batch(value, batch, device, dtype):
+    return torch.as_tensor(
+        np.broadcast_to(np.asarray(value, dtype=float), (batch,)).copy(),
+        device=device,
+        dtype=dtype,
+    )
+
+
+def train_policy_batched(
+    state0=(0, 1, 1.05),
+    batch=1,
+    horizon=1.0,
+    effort_horizon=None,
+    iters=600,
+    learning_rate=0.05,
+    effort_weight=DEFAULT_EFFORT_WEIGHT,
+    penalize_effort=False,
+    integrator=euler_step,
+    device=None,
+    dtype=None,
+    use_graph=True,
+):
+    """Train `batch` independent policies at once.
+
+    `learning_rate` and `effort_weight` may be scalars or length-`batch`
+    sequences -- those are the two axes a grid can vary without changing the
+    shape of the computation, so they ride along the batch. Anything that
+    changes the step count or the integrator has to be a separate call.
+
+    Returns (w, b, history), history being (iters, batch, 3) of
+    (task, λ·effort, total) -- the same three series the scalar loop recorded.
+    """
+    device = resolve_device(device)
+    dtype = dtype if dtype is not None else default_dtype(device)
+
+    steps = round(horizon / (LYAPUNOV_EXP * DT))
+    # the penalty is meant to price the control we actually deploy, so it is
+    # measured over the evaluation horizon rather than the training window --
+    # a law that looks cheap over one Lyapunov time can cost several times
+    # more once the run continues past it. None keeps the two windows equal.
+    effort_steps = (
+        steps if effort_horizon is None else round(effort_horizon / (LYAPUNOV_EXP * DT))
+    )
+
+    lam = _as_batch(effort_weight, batch, device, dtype)
+    lr = _as_batch(learning_rate, batch, device, dtype)
+
+    w, b = init_policy_params(batch, device=device, dtype=dtype)
+    state0 = (
+        torch.as_tensor(np.asarray(state0, dtype=float), device=device, dtype=dtype)
+        .expand(batch, 3)
+        .contiguous()
+    )
+
+    opt = BatchedAdam([w, b], [lr.unsqueeze(-1), lr])
+    history = torch.zeros(iters, batch, 3, device=device, dtype=dtype)
+    step_index = torch.zeros(1, dtype=torch.long, device=device)
+
+    def iteration():
+        traj = rollout_torch(
+            state0,
+            lambda s: linear_policy((w, b), s),
+            steps=steps,
+            integrator=integrator,
+        )
+        task = task_loss(traj)
+
+        if penalize_effort and effort_steps != steps:
+            # moments of a rollout we do not differentiate through: over this
+            # many Lyapunov times the pathwise gradient is pure amplified noise
+            # (run -lgh to see it blow up), so the gradient reaches w and b
+            # through the policy alone. Cheap, and well conditioned.
+            effort = effort_from_moments(
+                effort_moments(state0, (w, b), effort_steps, integrator), (w, b)
+            )
+        else:
+            # unpenalized runs only log the number, so keep the rollout short
+            effort = effort_penalty(traj, (w, b))
+
+        penalty = lam * effort
+        loss = task + penalty if penalize_effort else task
+
+        # the policies are independent, so the sum hands each element exactly
+        # the gradient it would have got from its own backward pass
+        loss.sum().backward()
+
+        opt.step(step_index + 1)
+
+        history.index_copy_(
+            0,
+            step_index,
+            torch.stack((task, penalty, loss), dim=-1).detach().unsqueeze(0),
+        )
+        step_index.add_(1)
+        opt.zero_grad()
+
+    if use_graph and device == "cuda":
+        _replay_graphed(iteration, iters, [w, b], opt, step_index)
+    else:
+        for _ in range(iters):
+            iteration()
+
+    return w.detach(), b.detach(), history.cpu().numpy()
+
+
+def _replay_graphed(iteration, iters, params, opt, step_index, warmup=3):
+    """Capture one training iteration and replay it, to stop paying for launches.
+
+    A 221-step window is ~2000 kernel launches forward and back; at a few
+    microseconds each that overhead *is* the iteration, and it does not shrink
+    as the batch grows. Capturing the whole iteration once and replaying it
+    drops it from ~35 ms to ~8 ms, flat out to at least B=4096.
+
+    The warmup runs are real training steps -- they have to be, to force the
+    Triton compile, the autograd graph and the optimizer state into existence
+    before capture -- so everything they touched is reset before the capture.
+    """
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+
+    with torch.cuda.stream(stream):
+        for _ in range(warmup):
+            iteration()
+
+    torch.cuda.current_stream().wait_stream(stream)
+
+    with torch.no_grad():
+        for p in params:
+            p.zero_()
+
+    opt.reset()
+    step_index.zero_()
+
+    graph = torch.cuda.CUDAGraph()
+
+    with torch.cuda.graph(graph):
+        iteration()
+
+    for _ in range(iters):
+        graph.replay()
+
+    torch.cuda.synchronize()
 
 
 def train_policy(
@@ -122,66 +326,46 @@ def train_policy(
     integrator=euler_step,
     history=None,
     verbose=True,
+    device=None,
+    dtype=None,
+    use_graph=True,
 ):
-    # history, if given, is a list that collects (task, penalty, total) per iter
-    steps = round(horizon / (LYAPUNOV_EXP * DT))
-    # the penalty is meant to price the control we actually deploy, so it is
-    # measured over the evaluation horizon rather than the training window --
-    # a law that looks cheap over one Lyapunov time can cost several times
-    # more once the run continues past it. None keeps the two windows equal.
-    effort_steps = (
-        steps if effort_horizon is None else round(effort_horizon / (LYAPUNOV_EXP * DT))
+    """One policy, as a batch of one. `history`, if given, collects the triples."""
+    w, b, recorded = train_policy_batched(
+        state0=state0,
+        batch=1,
+        horizon=horizon,
+        effort_horizon=effort_horizon,
+        iters=iters,
+        learning_rate=lr,
+        effort_weight=effort_weight,
+        penalize_effort=penalize_effort,
+        integrator=integrator,
+        device=device,
+        dtype=dtype,
+        use_graph=use_graph,
     )
 
-    if params is None:
-        params = init_policy_params()
+    if history is not None:
+        history.extend(tuple(row) for row in recorded[:, 0, :])
 
-    opt = torch.optim.Adam(params, lr=lr)
-
-    for i in range(iters):
-        opt.zero_grad()
-        traj = rollout_torch(
-            state0,
-            lambda s: linear_policy(params, s),
-            steps=steps,
-            integrator=integrator,
-        )
-        task = task_loss(traj)
-
-        if penalize_effort and effort_steps != steps:
-            # moments of a rollout we do not differentiate through: over this
-            # many Lyapunov times the pathwise gradient is pure amplified noise
-            # (run -lgh to see it blow up), so the gradient reaches w and b
-            # through the policy alone. Cheap, and well conditioned.
-            effort = effort_from_moments(
-                effort_moments(state0, params, effort_steps, integrator), params
-            )
-        else:
-            # unpenalized runs only log the number, so keep the rollout short
-            effort = effort_penalty(traj, params)
-
-        if penalize_effort:
-            loss = task + effort_weight * effort
-        else:
-            loss = task
-        loss.backward()
-        opt.step()
-
-        if history is not None:
-            history.append((task.item(), effort_weight * effort.item(), loss.item()))
-
-        if verbose and i % 20 == 0:
-            w, b = params
-            rms = U_REF * effort.item() ** 0.5
+    if verbose:
+        # read back off the recorded history rather than printing inside the
+        # loop, which on the graphed path would sync the device every iteration
+        for i in range(0, iters, 20):
+            task, penalty, total = recorded[i, 0]
             print(
-                f"iter {i:4d}  loss {loss.item():.4f}   task {task.item():.4f}   "
-                f"pen {effort_weight * effort.item():.4f}   |u|rms {rms:7.2f}   "
-                f"w {w.detach().numpy().round(3)}   b {b.item():+.3f}"
+                f"iter {i:4d}  loss {total:.4f}   task {task:.4f}   pen {penalty:.4f}"
             )
 
-    return params
+        print(f"w {w[0].cpu().numpy().round(3)}   b {b[0].item():+.3f}")
+
+    # the rest of the project -- figures.py above all -- works in float64 on
+    # the cpu, so the single-run door hands back what it always did whatever
+    # device and precision the batch actually trained in
+    return w[0].cpu().to(torch.float64), b[0].cpu().to(torch.float64)
 
 
 if __name__ == "__main__":
     w, b = train_policy(lr=0.02)
-    print("learned feedback law: w =", w.detach().numpy(), ". (x,y,z) +", b.item())
+    print("learned feedback law: w =", w.cpu().numpy(), ". (x,y,z) +", b.item())
