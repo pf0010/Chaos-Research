@@ -172,6 +172,67 @@ def test_batching_does_not_change_the_answer():
     assert torch.equal(b[1], b[3])
 
 
+def test_mixed_windows_match_their_own_runs():
+    """A short lane riding along a longer batch must equal a run at its length.
+
+    Every lane here integrates to the longest window in the batch and is masked
+    back to its own, so this is the check that the mask covers exactly the
+    steps a standalone run would have taken -- one step out in either direction
+    and the shorter lanes would drift.
+
+    effort_horizon is left None on purpose. With the long moment rollout in
+    play a last-bit difference is amplified into a visible one, which would
+    make this a measurement of the attractor rather than of the mask.
+    """
+    if not CUDA:
+        print("  (skipped: no CUDA device)")
+        return
+
+    horizons = [1.0, 1.25, 1.5, 1.75, 2.0]
+    lams = [0.06, 0.08, 0.10, 0.12, 0.14]
+    common = dict(
+        iters=120,
+        penalize_effort=True,
+        effort_horizon=None,
+        learning_rate=0.05,
+        device="cuda",
+        dtype=torch.float64,
+    )
+
+    w, b, _ = train_policy_batched(
+        batch=5, horizon=horizons, effort_weight=lams, use_graph=True, **common
+    )
+
+    for i, (horizon, lam) in enumerate(zip(horizons, lams)):
+        w_one, b_one, _ = train_policy_batched(
+            batch=1,
+            horizon=horizon,
+            effort_weight=[lam],
+            use_graph=False,
+            **common,
+        )
+
+        assert (w[i] - w_one[0]).abs().max() < 1e-12, (horizon, w[i], w_one[0])
+        assert (b[i] - b_one[0]).abs().max() < 1e-12, (horizon, b[i], b_one[0])
+
+
+def test_a_batch_may_not_mix_the_two_penalties():
+    """Pathwise and frozen-moment penalties are different objectives."""
+    try:
+        train_policy_batched(
+            batch=2,
+            horizon=[1.0, 2.0],
+            effort_horizon=1.0,
+            penalize_effort=True,
+            iters=2,
+            device="cpu",
+        )
+    except ValueError:
+        return
+
+    raise AssertionError("a mixed batch should have been refused")
+
+
 def test_chaos_dominates_precision():
     """Why float32 on the GPU is not the thing costing accuracy.
 

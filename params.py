@@ -108,6 +108,11 @@ PARAMS = (
         1.0,
         float,
         _decimal(3),
+        # a shorter window rides along a longer one: every lane integrates to
+        # the longest window in the batch and its loss is masked back to its
+        # own. The extra steps are free -- see kernels.py on how little of the
+        # GPU a grid this size occupies -- and max() beats sum()
+        batchable=True,
     ),
     Param(
         "plot_horizon",

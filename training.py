@@ -54,11 +54,24 @@ def soft_step(x, softness=SOFTNESS):
     return 0.5 * (1 + tanh(x / softness))
 
 
-def task_loss(traj, softness=SOFTNESS):
-    # mean over the time axis only: a scalar for one policy, (B,) for a batch
-    x = traj[..., 0]
+def masked_mean(values, mask):
+    """Mean down the time axis over the entries `mask` keeps.
 
-    return (1 - soft_step(x, softness)).mean(0)
+    torch.where rather than a multiply by 0/1: a lane that has been integrated
+    past its own window contributes exactly zero even if its tail went
+    non-finite, where 0 * nan would have poisoned the whole batch's gradient.
+    """
+    return torch.where(mask, values, 0.0).sum(0) / mask.sum(0)
+
+
+def task_loss(traj, softness=SOFTNESS, mask=None):
+    # mean over the time axis only: a scalar for one policy, (B,) for a batch.
+    # `mask` is how lanes with different training windows share one rollout --
+    # (steps+1, B), true for the steps that lane actually trains on
+    x = traj[..., 0]
+    shortfall = 1 - soft_step(x, softness)
+
+    return shortfall.mean(0) if mask is None else masked_mean(shortfall, mask)
 
 
 def success_fraction(traj):
@@ -72,13 +85,14 @@ def success_fraction(traj):
     return (x > 0).mean(0)
 
 
-def effort_penalty(traj, params, u_ref=U_REF):
+def effort_penalty(traj, params, u_ref=U_REF, mask=None):
     w, b = params
 
     # the control at the final state is never applied, so drop it
     u = (traj[:-1] * w).sum(-1) + b
+    cost = (u / u_ref).pow(2)
 
-    return (u / u_ref).pow(2).mean(0)
+    return cost.mean(0) if mask is None else masked_mean(cost, mask)
 
 
 def effort_moments(state0, params, steps, integrator=euler_step):
@@ -194,10 +208,14 @@ def train_policy_batched(
 ):
     """Train `batch` independent policies at once.
 
-    `learning_rate` and `effort_weight` may be scalars or length-`batch`
-    sequences -- those are the two axes a grid can vary without changing the
-    shape of the computation, so they ride along the batch. Anything that
-    changes the step count or the integrator has to be a separate call.
+    `learning_rate`, `effort_weight` and `horizon` may each be a scalar or a
+    length-`batch` sequence; those are the axes a grid can vary within one
+    run. The first two are per-element numbers the arithmetic carries anyway.
+    `horizon` is the interesting one: it does change the step count, so the
+    batch integrates to the longest window in it and each lane's loss is
+    masked back to its own -- which costs max(steps) rather than sum(steps).
+    The integrator, the iteration count and the evaluation window still have
+    to match across a batch, so those stay separate calls.
 
     Returns (w, b, history), history being (iters, batch, 3) of
     (task, λ·effort, total) -- the same three series the scalar loop recorded.
@@ -205,14 +223,51 @@ def train_policy_batched(
     device = resolve_device(device)
     dtype = dtype if dtype is not None else default_dtype(device)
 
-    steps = round(horizon / (LYAPUNOV_EXP * DT))
+    # `horizon` may differ per lane. Every lane is then integrated to the
+    # longest window in the batch and masked back to its own, which costs the
+    # longest window once instead of every window in turn -- the batch axis is
+    # very nearly free (kernels.py), the step count is not.
+    horizons = np.broadcast_to(np.asarray(horizon, dtype=float), (batch,))
+    lane_steps = np.array([round(h / (LYAPUNOV_EXP * DT)) for h in horizons])
+    steps = int(lane_steps.max())
+    uniform = bool((lane_steps == lane_steps[0]).all())
+
     # the penalty is meant to price the control we actually deploy, so it is
     # measured over the evaluation horizon rather than the training window --
     # a law that looks cheap over one Lyapunov time can cost several times
     # more once the run continues past it. None keeps the two windows equal.
-    effort_steps = (
-        steps if effort_horizon is None else round(effort_horizon / (LYAPUNOV_EXP * DT))
-    )
+    if effort_horizon is None:
+        # the penalty rides the training trajectory, so it is differentiated
+        # through the states like the task term is
+        effort_steps = None
+        pathwise = np.ones(batch, dtype=bool)
+    else:
+        effort_steps = round(effort_horizon / (LYAPUNOV_EXP * DT))
+        pathwise = lane_steps == effort_steps
+
+    # the two penalties are not the same objective -- one lets the gradient run
+    # back through the states, the other freezes them -- so a batch may not mix
+    # them. sweep.py keys its groups on this, so a grid never asks for it
+    if pathwise.any() and not pathwise.all():
+        raise ValueError(
+            "this batch mixes lanes whose effort window equals their training "
+            "window with lanes whose does not. Those differentiate the penalty "
+            "differently (pathwise states vs frozen moments) and cannot share "
+            "a run; split them, or set effort_horizon clear of every window"
+        )
+
+    use_moments = penalize_effort and not pathwise.all()
+
+    if uniform:
+        task_mask = effort_mask = None
+    else:
+        ticks = torch.arange(steps + 1, device=device).unsqueeze(-1)
+        lanes = torch.as_tensor(lane_steps, device=device).unsqueeze(0)
+
+        # task_loss averages over states 0..steps inclusive, effort_penalty
+        # over the controls at 0..steps-1, so the two windows differ by one
+        task_mask = ticks <= lanes
+        effort_mask = ticks[:-1] < lanes
 
     lam = _as_batch(effort_weight, batch, device, dtype)
     lr = _as_batch(learning_rate, batch, device, dtype)
@@ -235,9 +290,9 @@ def train_policy_batched(
             steps=steps,
             integrator=integrator,
         )
-        task = task_loss(traj)
+        task = task_loss(traj, mask=task_mask)
 
-        if penalize_effort and effort_steps != steps:
+        if use_moments:
             # moments of a rollout we do not differentiate through: over this
             # many Lyapunov times the pathwise gradient is pure amplified noise
             # (run -lgh to see it blow up), so the gradient reaches w and b
@@ -247,7 +302,7 @@ def train_policy_batched(
             )
         else:
             # unpenalized runs only log the number, so keep the rollout short
-            effort = effort_penalty(traj, (w, b))
+            effort = effort_penalty(traj, (w, b), mask=effort_mask)
 
         penalty = lam * effort
         loss = task + penalty if penalize_effort else task

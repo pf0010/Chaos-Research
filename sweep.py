@@ -192,6 +192,10 @@ def group_grid(grid):
 
     for values in grid:
         key = tuple(csv_value(name, values[name]) for name in SHAPING)
+        # a point whose effort window happens to coincide with its training
+        # window is scored by the pathwise penalty rather than the frozen
+        # moments -- a different objective, so it gets its own group
+        key += (values["plot_horizon"] == values["train_horizon"],)
         groups.setdefault(key, []).append(values)
 
     return list(groups.values())
@@ -214,7 +218,7 @@ def train_group(group, device, dtype, use_graph):
     w, b, history = train_policy_batched(
         state0=settings["initial_condition"],
         batch=len(group),
-        horizon=settings["train_horizon"],
+        horizon=[values["train_horizon"] for values in group],
         effort_horizon=settings["plot_horizon"],
         iters=settings["iters"],
         learning_rate=[values["learning_rate"] for values in group],
@@ -502,8 +506,11 @@ if __name__ == "__main__":
             held = {
                 name: group[0][name] for name in SHAPING if name in axis_names
             }
+            # the distinct values, not one entry per lane: a merged group holds
+            # the whole grid and listing it lane by lane says nothing
             varies = {
-                name: [values[name] for values in group] for name in batched_over
+                name: sorted({values[name] for values in group})
+                for name in batched_over
             }
             print(f"group {n}: {len(group)} point(s)  {held}  batched {varies}")
         sys.exit(0)
@@ -556,8 +563,9 @@ if __name__ == "__main__":
             f"{name}={group[0][name]}" for name in SHAPING if name in axis_names
         )
         print(
-            f"[group {n}/{len(groups)}] {len(group)} point(s)  {held}  "
-            f"{elapsed:.1f}s  success {success.min():.4f}-{success.max():.4f}",
+            f"[group {n}/{len(groups)}] {len(group)} point(s)  "
+            + (f"{held}  " if held else "")
+            + f"{elapsed:.1f}s  success {success.min():.4f}-{success.max():.4f}",
             flush=True,
         )
 
