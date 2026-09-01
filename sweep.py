@@ -174,8 +174,6 @@ def build_base(args, axes):
         )
 
     base = defaults()
-    # the sweep has always regularized unless told otherwise
-    base["penalize_effort"] = True
     base.update(overrides)
 
     return base
@@ -450,7 +448,7 @@ if __name__ == "__main__":
         "-npe",
         "--no_penalize_effort",
         action="store_true",
-        help="drop -pe; lambda then has no effect on training",
+        help="train on the task term alone; lambda then has no effect on training",
     )
     flags.add_argument("--dry_run", "--dry-run", action="store_true", dest="dry_run")
     args = parser.parse_args()

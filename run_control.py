@@ -1,6 +1,6 @@
 """Train a feedback law on the Lorenz system and plot the result.
 
-    python run_control.py -th 1.0 -i 600 -pe   # train, then show the summary
+    python run_control.py -th 1.0 -i 600       # train, then show the summary
     python run_control.py -loss -s             # also save a loss curve
     python run_control.py -lgh 8               # loss-gradient vs. horizon
 
@@ -71,7 +71,12 @@ if __name__ == "__main__":
     flags.add_argument(
         "--no_graph", "--no-graph", dest="no_graph", action="store_true"
     )
-    flags.add_argument("-pe", "--penalize_effort", action="store_true")
+    flags.add_argument(
+        "-npe",
+        "--no_penalize_effort",
+        action="store_true",
+        help="train on the task term alone; λ then has no effect on training",
+    )
     flags.add_argument(
         "-euler",
         "--euler",
@@ -82,6 +87,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     integrator = euler_step if args.euler else rk4_step
+    penalize_effort = not args.no_penalize_effort
     name_keys = (
         [resolve(name).name for name in args.name_keys.split(",") if name.strip()]
         if args.name_keys is not None
@@ -104,7 +110,7 @@ if __name__ == "__main__":
             horizon=args.train_horizon,
             effort_horizon=args.plot_horizon,
             iters=args.iters,
-            penalize_effort=args.penalize_effort,
+            penalize_effort=penalize_effort,
             effort_weight=args.effort_weight,
             integrator=integrator,
             history=history,
@@ -121,7 +127,7 @@ if __name__ == "__main__":
                 train_horizon=args.train_horizon,
                 plot_horizon=args.plot_horizon,
                 iters=args.iters,
-                penalize_effort=args.penalize_effort,
+                penalize_effort=penalize_effort,
                 effort_weight=args.effort_weight,
                 integrator=integrator,
                 save=args.save,
@@ -136,7 +142,7 @@ if __name__ == "__main__":
             train_horizon=args.train_horizon,
             plot_horizon=args.plot_horizon,
             iters=args.iters,
-            penalize_effort=args.penalize_effort,
+            penalize_effort=penalize_effort,
             save=args.save,
             effort_weight=args.effort_weight,
             integrator=integrator,

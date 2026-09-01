@@ -165,7 +165,7 @@ def plot_lorenz_overview():
 def plot_state_and_control(
     traj,
     u,
-    penalize_effort=False,
+    penalize_effort=True,
     caption=None,
     axes=None,
 ):
@@ -207,7 +207,7 @@ def plot_state_and_control(
 def plot_attractor_3d(
     traj,
     u,
-    penalize_effort=False,
+    penalize_effort=True,
     caption=None,
     ax=None,
 ):
@@ -319,7 +319,7 @@ def plot_loss_curve(
     train_horizon=1.0,
     plot_horizon=100,
     iters=600,
-    penalize_effort=False,
+    penalize_effort=True,
     effort_weight=DEFAULT_EFFORT_WEIGHT,
     integrator=rk4_step,
     save=False,
@@ -552,7 +552,7 @@ def plot_run_summary(
     train_horizon=1.0,
     plot_horizon=25,
     iters=600,
-    penalize_effort=False,
+    penalize_effort=True,
     save=False,
     effort_weight=DEFAULT_EFFORT_WEIGHT,
     integrator=rk4_step,

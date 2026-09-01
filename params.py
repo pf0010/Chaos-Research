@@ -69,7 +69,7 @@ class Param:
     show: Callable[[Any], str] = str  # value -> caption text
     sweepable: bool = True
     # set by the flag's presence, not by a value. Which way the flag pushes is
-    # the default's business: -pe turns the penalty on, -euler turns rk4 off
+    # the default's business: -npe turns the penalty off, -euler turns rk4 off
     is_flag: bool = False
     nargs: int = 1
     # whether a sweep can vary this *within* one batched training run. Only a
@@ -147,9 +147,9 @@ PARAMS = (
     Param(
         "penalize_effort",
         "reg",
-        "-pe",
+        "-npe",
         "effort penalty",
-        False,
+        True,
         parse_bool,
         lambda v: "on" if v else "off",
         show=lambda v: "on" if v else "off",

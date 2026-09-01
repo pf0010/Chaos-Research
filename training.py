@@ -9,6 +9,11 @@ and the objectives reduce over time only, returning one number per policy. B
 independent policies then train in one set of kernels instead of B sets, which
 is what makes a sweep worth putting on a GPU at all -- see kernels.py for why
 a single 3-component state emphatically is not.
+
+The effort penalty is on by default: without it nothing bounds `u`, and the
+law that comes back "works" by shoving impossibly hard on x. `penalize_effort`
+is kept because a run can still ask for the task term alone (`-npe`, `reg=0`)
+and compare the two.
 """
 
 import numpy as np
@@ -200,7 +205,7 @@ def train_policy_batched(
     iters=600,
     learning_rate=0.05,
     effort_weight=DEFAULT_EFFORT_WEIGHT,
-    penalize_effort=False,
+    penalize_effort=True,
     integrator=rk4_step,
     device=None,
     dtype=None,
@@ -377,7 +382,7 @@ def train_policy(
     iters=600,
     lr=0.1,
     effort_weight=DEFAULT_EFFORT_WEIGHT,
-    penalize_effort=False,
+    penalize_effort=True,
     integrator=rk4_step,
     history=None,
     verbose=True,
