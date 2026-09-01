@@ -163,8 +163,8 @@ def build_base(args, axes):
     # counts as an override
     if args.no_penalize_effort:
         overrides["penalize_effort"] = False
-    if args.rk4:
-        overrides["rk4"] = True
+    if args.euler:
+        overrides["rk4"] = False
 
     clash = sorted(set(overrides) & set(axes))
 
@@ -434,7 +434,12 @@ if __name__ == "__main__":
         action="store_true",
         help="skip the success plot the grid otherwise saves alongside its csv",
     )
-    flags.add_argument("-rk4", "--rk4", action="store_true")
+    flags.add_argument(
+        "-euler",
+        "--euler",
+        action="store_true",
+        help="integrate with forward euler instead of the default rk4",
+    )
     flags.add_argument(
         "-loss",
         "--loss_curve",

@@ -15,7 +15,7 @@ import numpy as np
 import torch
 
 from kernels import default_dtype, moment_stats, resolve_device
-from lorenz import DT, LYAPUNOV_EXP, euler_step, rollout_torch
+from lorenz import DT, LYAPUNOV_EXP, rk4_step, rollout_torch
 from params import DEFAULT_EFFORT_WEIGHT
 
 SOFTNESS = 2.0
@@ -95,7 +95,7 @@ def effort_penalty(traj, params, u_ref=U_REF, mask=None):
     return cost.mean(0) if mask is None else masked_mean(cost, mask)
 
 
-def effort_moments(state0, params, steps, integrator=euler_step):
+def effort_moments(state0, params, steps, integrator=rk4_step):
     """<s> and <s sᵀ> over a rollout we deliberately do not differentiate.
 
     The penalty is quadratic in the policy, so these two moments are the whole
@@ -201,7 +201,7 @@ def train_policy_batched(
     learning_rate=0.05,
     effort_weight=DEFAULT_EFFORT_WEIGHT,
     penalize_effort=False,
-    integrator=euler_step,
+    integrator=rk4_step,
     device=None,
     dtype=None,
     use_graph=True,
@@ -378,7 +378,7 @@ def train_policy(
     lr=0.1,
     effort_weight=DEFAULT_EFFORT_WEIGHT,
     penalize_effort=False,
-    integrator=euler_step,
+    integrator=rk4_step,
     history=None,
     verbose=True,
     device=None,

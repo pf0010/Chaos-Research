@@ -8,7 +8,7 @@ parameter is a single edit rather than four consistent ones.
 
 Filenames built from it look like
 
-    lam0p100_th1p000_reg-on_int-euler.png
+    lam0p100_th1p000_reg-on_int-rk4.png
 
 Fixed decimal places so a directory sorts in numeric order, `p` instead of `.`
 so the name survives \\includegraphics, and an explicit token for every value so
@@ -61,14 +61,16 @@ def _parse_vector(text):
 class Param:
     name: str  # canonical: the csv column and the run_control.py dest
     key: str  # short: what appears in a filename
-    flag: str  # run_control.py's short flag
+    flag: str  # run_control.py's short flag (for a bool, the one that flips it)
     label: str  # for captions and axis titles
     default: Any
     parse: Callable[[Any], Any]  # text -> value, for the cli and the csv
     fmt: Callable[[Any], str]  # value -> filename token body
     show: Callable[[Any], str] = str  # value -> caption text
     sweepable: bool = True
-    store_true: bool = False  # set by the flag's presence, not by a value
+    # set by the flag's presence, not by a value. Which way the flag pushes is
+    # the default's business: -pe turns the penalty on, -euler turns rk4 off
+    is_flag: bool = False
     nargs: int = 1
     # whether a sweep can vary this *within* one batched training run. Only a
     # parameter that leaves the shape of the computation alone can: it rides
@@ -151,18 +153,18 @@ PARAMS = (
         parse_bool,
         lambda v: "on" if v else "off",
         show=lambda v: "on" if v else "off",
-        store_true=True,
+        is_flag=True,
     ),
     Param(
         "rk4",
         "int",
-        "-rk4",
+        "-euler",
         "integrator",
-        False,
+        True,
         parse_bool,
         lambda v: "rk4" if v else "euler",
         show=lambda v: "on" if v else "off",
-        store_true=True,
+        is_flag=True,
     ),
 )
 
@@ -239,7 +241,7 @@ def csv_value(name, value):
 
     if param.nargs > 1:
         return "|".join(str(c) for c in value)
-    if param.store_true:
+    if param.is_flag:
         return int(bool(value))
 
     return value

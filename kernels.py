@@ -12,7 +12,9 @@ each the GPU is 2.5x *slower* than the CPU no matter how big the batch gets --
 it is never computing, only launching. So the whole time loop goes inside one
 kernel instead: one thread per grid point, x/y/z and the moment accumulators
 live in registers for the entire rollout, and there is exactly one launch and
-one write at the end. Measured on an RTX 5070, 22085 steps:
+one write at the end. Measured on an RTX 5070, 22085 euler steps (rk4, the
+default, is four rhs evaluations a step and costs proportionally more in the
+last column; the other two are launch-bound and barely notice):
 
     B       torch/CPU     torch/CUDA     this kernel (fp32)
     1          428 ms        1208 ms               0.38 ms
@@ -27,7 +29,7 @@ time.
 import numpy as np
 import torch
 
-from lorenz import BETA, DT, PRANDTL, RAYLEIGH, euler_step, rk4_step
+from lorenz import BETA, DT, PRANDTL, RAYLEIGH, rk4_step
 
 try:
     import triton
@@ -168,7 +170,7 @@ if HAVE_TRITON:
 BLOCK = 64
 
 
-def moment_stats_cuda(state0, w, b, steps, integrator=euler_step):
+def moment_stats_cuda(state0, w, b, steps, integrator=rk4_step):
     """<s sᵀ> and <s> over `steps`, for a batch of policies, in one launch."""
     w = w.contiguous()
     b = b.contiguous()
@@ -201,7 +203,7 @@ def moment_stats_cuda(state0, w, b, steps, integrator=euler_step):
     return M, m
 
 
-def moment_stats_numpy(state0, w, b, steps, integrator=euler_step):
+def moment_stats_numpy(state0, w, b, steps, integrator=rk4_step):
     """The CPU path: the same accumulation, batched over the leading axis."""
     w = np.asarray(w, dtype=float)
     b = np.asarray(b, dtype=float)
@@ -222,7 +224,7 @@ def moment_stats_numpy(state0, w, b, steps, integrator=euler_step):
     return M / steps, m / steps
 
 
-def moment_stats(state0, w, b, steps, integrator=euler_step):
+def moment_stats(state0, w, b, steps, integrator=rk4_step):
     """Dispatch on where the parameters already live."""
     if isinstance(w, torch.Tensor) and w.is_cuda:
         return moment_stats_cuda(state0, w, b, steps, integrator)

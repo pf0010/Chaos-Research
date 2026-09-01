@@ -15,7 +15,6 @@ from mpl_toolkits.mplot3d.art3d import Line3DCollection
 from lorenz import (
     DT,
     LYAPUNOV_EXP,
-    euler_step,
     rk4_step,
     rollout_numpy,
     rollout_torch,
@@ -74,7 +73,7 @@ def add_caption(fig, caption):
         fig.text(0.5, 0.01, caption, ha="center", fontsize=8, color="gray")
 
 
-def rollout_closed_loop(params, state0=(0, 1, 1.05), steps=300, integrator=euler_step):
+def rollout_closed_loop(params, state0=(0, 1, 1.05), steps=300, integrator=rk4_step):
     # the trajectory is only ever plotted, and taping a rollout this long costs
     # about as much again as integrating it
     with torch.no_grad():
@@ -266,7 +265,7 @@ def plot_state_sensitivity_vs_horizon(state0, u_tensor, max_horizon=1.0, coord=0
 
 
 def plot_loss_gradient_vs_horizon(
-    state0=(0, 1, 1.05), max_horizon=8.0, n=50, save=False, integrator=euler_step
+    state0=(0, 1, 1.05), max_horizon=8.0, n=50, save=False, integrator=rk4_step
 ):
     horizons = np.linspace(0.1, max_horizon, n)
     norms = []
@@ -322,7 +321,7 @@ def plot_loss_curve(
     iters=600,
     penalize_effort=False,
     effort_weight=DEFAULT_EFFORT_WEIGHT,
-    integrator=euler_step,
+    integrator=rk4_step,
     save=False,
     out_dir=None,
     name_keys=None,
@@ -556,7 +555,7 @@ def plot_run_summary(
     penalize_effort=False,
     save=False,
     effort_weight=DEFAULT_EFFORT_WEIGHT,
-    integrator=euler_step,
+    integrator=rk4_step,
     traj=None,
     u=None,
     out_dir=None,

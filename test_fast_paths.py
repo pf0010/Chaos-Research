@@ -236,9 +236,14 @@ def test_a_batch_may_not_mix_the_two_penalties():
 def test_chaos_dominates_precision():
     """Why float32 on the GPU is not the thing costing accuracy.
 
-    Over the evaluation window the moments move further under a 1e-12 nudge to
-    the initial condition, in float64 throughout, than they do between float32
-    and float64. Any argument for fp64 here has to clear that bar first.
+    Over the evaluation window the moments move further under a nudge of ~1e-12
+    to the initial condition, in float64 throughout, than they do between
+    float32 and float64. Any argument for fp64 here has to clear that bar first.
+
+    The bar is read off several nudges rather than one. What a single nudge
+    costs is itself a few-percent number drawn from a wide spread -- these four
+    span a factor of five -- so one sample of it is not a bar, it is a coin
+    flip that happens to have landed above fp32.
     """
     params = (torch.zeros(3, dtype=torch.float64), torch.zeros((), dtype=torch.float64))
     steps = 22085
@@ -246,9 +251,13 @@ def test_chaos_dominates_precision():
     # effort_moments hands back whatever kind its parameters were, so pull the
     # comparison into numpy rather than subtracting a tensor from an array
     M = effort_moments([0, 1, 1.05], params, steps)[0].numpy()
-    M_nudged = effort_moments([0, 1 + 1e-12, 1.05], params, steps)[0].numpy()
+    nudged = [
+        np.abs(effort_moments([0, 1 + eps, 1.05], params, steps)[0].numpy() - M).max()
+        / np.abs(M).max()
+        for eps in (1e-12, 2e-12, 5e-12, -1e-12)
+    ]
 
-    chaos = np.abs(M_nudged - M).max() / np.abs(M).max()
+    chaos = float(np.median(nudged))
     assert chaos > 1e-2, f"expected the attractor to dominate, got {chaos:.2e}"
 
     if CUDA:
@@ -261,7 +270,7 @@ def test_chaos_dominates_precision():
         )
         precision = np.abs(M32[0].cpu().numpy() - M).max() / np.abs(M).max()
 
-        assert precision < chaos, f"fp32 {precision:.2e} vs 1e-12 nudge {chaos:.2e}"
+        assert precision < chaos, f"fp32 {precision:.2e} vs 1e-12 nudges {chaos:.2e}"
         print(f"  fp32 costs {precision:.1%}; a 1e-12 nudge costs {chaos:.1%}")
 
 

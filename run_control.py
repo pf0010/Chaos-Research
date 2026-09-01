@@ -72,11 +72,16 @@ if __name__ == "__main__":
         "--no_graph", "--no-graph", dest="no_graph", action="store_true"
     )
     flags.add_argument("-pe", "--penalize_effort", action="store_true")
-    flags.add_argument("-rk4", "--rk4", action="store_true")
+    flags.add_argument(
+        "-euler",
+        "--euler",
+        action="store_true",
+        help="integrate with forward euler instead of the default rk4",
+    )
     flags.add_argument("-loss", "--loss_curve", action="store_true")
     args = parser.parse_args()
 
-    integrator = rk4_step if args.rk4 else euler_step
+    integrator = euler_step if args.euler else rk4_step
     name_keys = (
         [resolve(name).name for name in args.name_keys.split(",") if name.strip()]
         if args.name_keys is not None

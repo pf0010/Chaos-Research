@@ -3,6 +3,9 @@
 Knows nothing about controllers beyond the fact that a step takes some `u`:
 `eval_control` accepts either a constant or a callable of the state, so the
 same integrators serve an open-loop forcing and a learned feedback law.
+
+`rk4_step` is the default everywhere a rollout takes an integrator; euler is
+kept because a sweep can still ask for it (`rk4=0`) and compare the two.
 """
 
 import numpy as np
@@ -59,7 +62,7 @@ def rk4_step(state, control, dt=DT):
     return state + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4), k1
 
 
-def rollout_numpy(state0, steps=DEFAULT_STEPS, u=0.0, integrator=euler_step):
+def rollout_numpy(state0, steps=DEFAULT_STEPS, u=0.0, integrator=rk4_step):
     state = np.array(state0, dtype=float)
 
     traj = np.empty((steps + 1, 3))
@@ -78,7 +81,7 @@ def rollout_numpy(state0, steps=DEFAULT_STEPS, u=0.0, integrator=euler_step):
     return traj, derivs
 
 
-def rollout_torch(state0, control, steps=DEFAULT_STEPS, integrator=euler_step):
+def rollout_torch(state0, control, steps=DEFAULT_STEPS, integrator=rk4_step):
     """Time-first: (steps+1, 3), or (steps+1, B, 3) if `state0` is a batch.
 
     A tensor `state0` is taken as it is, so the caller picks the device and the
@@ -100,7 +103,7 @@ def rollout_torch(state0, control, steps=DEFAULT_STEPS, integrator=euler_step):
     return torch.stack(traj)
 
 
-def rollout_numpy_batched(state0, w, b, steps=DEFAULT_STEPS, integrator=euler_step):
+def rollout_numpy_batched(state0, w, b, steps=DEFAULT_STEPS, integrator=rk4_step):
     """Closed-loop rollout of B policies at once: traj (steps+1, B, 3), u (steps+1, B).
 
     Nothing here is differentiated -- this is the evaluation trajectory the
