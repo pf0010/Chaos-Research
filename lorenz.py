@@ -76,7 +76,7 @@ def rollout_numpy(state0, steps=DEFAULT_STEPS, u=0.0, integrator=rk4_step):
         derivs[t] = k1
         traj[t + 1] = state
 
-    derivs[steps] = lorenz_rhs(state, u)
+    derivs[steps] = lorenz_rhs(state, eval_control(u, state))
 
     return traj, derivs
 

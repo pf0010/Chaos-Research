@@ -17,8 +17,8 @@ import numpy as np
 import torch
 
 from kernels import cuda_available, moment_stats_cuda, moment_stats_numpy
-from lorenz import euler_step, lorenz_rhs, rk4_step
-from training import BatchedAdam, effort_moments, train_policy_batched
+from lorenz import euler_step, lorenz_rhs, rk4_step, rollout_numpy
+from training import BatchedAdam, effort_moments, linear_policy, train_policy_batched
 
 CUDA = cuda_available()
 
@@ -33,6 +33,33 @@ def test_rhs_is_batch_polymorphic():
 
     for i, (state, u) in enumerate(zip(states, us)):
         assert np.array_equal(lorenz_rhs(state, u), batched[i])
+
+
+def test_callable_control_is_honoured_on_every_row():
+    """A rollout must apply `u` through `eval_control` everywhere, last row included.
+
+    `derivs[steps]` is filled by its own call outside the integrator loop, so it
+    is the one row that can quietly skip `eval_control` while every other row
+    still looks right. Two ways in: a state-independent callable has to give
+    back exactly what the bare scalar gives, and a real policy has to leave the
+    closed-loop field -- not the uncontrolled one -- in that final row.
+    """
+    state0 = [0.0, 1.0, 1.05]
+
+    traj, derivs = rollout_numpy(state0, steps=50, u=2.5)
+    traj_fn, derivs_fn = rollout_numpy(state0, steps=50, u=lambda state: 2.5)
+
+    assert np.array_equal(traj, traj_fn)
+    assert np.array_equal(derivs, derivs_fn)
+
+    w, b = np.array([-2.7, 0.4, -0.1]), 22.9
+    policy = lambda state: linear_policy((w, b), state)  # noqa: E731
+    traj, derivs = rollout_numpy(state0, steps=50, u=policy)
+
+    final = lorenz_rhs(traj[-1], policy(traj[-1]))
+
+    assert np.array_equal(derivs[-1], final)
+    assert not np.array_equal(derivs[-1], lorenz_rhs(traj[-1], 0.0))
 
 
 def test_batched_adam_matches_torch():
