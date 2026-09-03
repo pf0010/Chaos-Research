@@ -17,7 +17,7 @@ import numpy as np
 import torch
 
 from kernels import cuda_available, moment_stats_cuda, moment_stats_numpy
-from lorenz import euler_step, lorenz_rhs, rk4_step, rollout_numpy
+from lorenz import euler_step, lorenz_rhs, rk4_step, rollout_numpy, rollout_numpy_batched
 from training import BatchedAdam, effort_moments, linear_policy, train_policy_batched
 
 CUDA = cuda_available()
@@ -241,6 +241,45 @@ def test_mixed_windows_match_their_own_runs():
 
         assert (w[i] - w_one[0]).abs().max() < 1e-12, (horizon, w[i], w_one[0])
         assert (b[i] - b_one[0]).abs().max() < 1e-12, (horizon, b[i], b_one[0])
+
+
+def test_mixed_starts_match_their_own_runs():
+    """A batch of initial conditions must equal a run from each start alone.
+
+    state0 is the newest axis a grid can batch over, and it is the one where a
+    bug would be quietest: a batch that silently shared one start would still
+    train, still converge and still plot -- it would just be answering a
+    question nobody asked. So this checks the laws exactly, and checks that
+    each lane's rollout actually began where it was told to.
+
+    effort_horizon is left None for the reason the mixed-window test gives.
+    """
+    starts = [(0.0, 1.0, 1.05), (0.5, 1.0, 1.05), (1.0, 1.0, 1.05), (-0.3, 0.2, 2.0)]
+    common = dict(
+        horizon=1.0,
+        iters=120,
+        penalize_effort=True,
+        effort_horizon=None,
+        learning_rate=0.05,
+        effort_weight=0.07,
+        device="cpu",
+        dtype=torch.float64,
+        use_graph=False,
+    )
+
+    w, b, _ = train_policy_batched(state0=starts, batch=len(starts), **common)
+
+    for i, start in enumerate(starts):
+        w_one, b_one, _ = train_policy_batched(state0=[start], batch=1, **common)
+
+        assert (w[i] - w_one[0]).abs().max() < 1e-12, (start, w[i], w_one[0])
+        assert (b[i] - b_one[0]).abs().max() < 1e-12, (start, b[i], b_one[0])
+
+    # the evaluation rollout broadcasts state0 against w rather than expanding
+    # it, so it is a separate place the starts could collapse
+    traj, _ = rollout_numpy_batched(starts, w.numpy(), b.numpy(), steps=4)
+
+    assert np.array_equal(traj[0], np.asarray(starts, dtype=float)), traj[0]
 
 
 def test_a_batch_may_not_mix_the_two_penalties():

@@ -213,9 +213,11 @@ def train_policy_batched(
 ):
     """Train `batch` independent policies at once.
 
-    `learning_rate`, `effort_weight` and `horizon` may each be a scalar or a
-    length-`batch` sequence; those are the axes a grid can vary within one
-    run. The first two are per-element numbers the arithmetic carries anyway.
+    `state0`, `learning_rate`, `effort_weight` and `horizon` may each be a
+    scalar (or single start) or a length-`batch` sequence; those are the axes a
+    grid can vary within one run. The middle two are per-element numbers the
+    arithmetic carries anyway, and `state0` is already a (batch, 3) tensor
+    here, so one start per lane costs nothing the shared start didn't.
     `horizon` is the interesting one: it does change the step count, so the
     batch integrates to the longest window in it and each lane's loss is
     masked back to its own -- which costs max(steps) rather than sum(steps).

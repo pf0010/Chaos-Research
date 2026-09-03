@@ -12,6 +12,7 @@ same number either way. See kernels.py.
     python sweep.py                             # the default lambda x window grid
     python sweep.py -sw lr=0.01:0.1:0.01        # sweep the learning rate instead
     python sweep.py -sw lam=0.05:0.15:0.01 -sw th=1:2:0.25 -sw rk4=0,1
+    python sweep.py -sw "ic=0:1:0.25|1|1.05"    # an ensemble of starts
     python sweep.py -j 4                        # cap at 4 figure-drawing workers
     python sweep.py -loss                       # also save a loss curve per point
     python sweep.py -np                         # skip the success plot at the end
@@ -23,15 +24,27 @@ An axis is NAME=start:stop:step (inclusive of stop) or NAME=v1,v2,v3, where
 NAME is any sweepable parameter in params.py, by canonical name or short key.
 Anything not swept keeps its default unless the matching flag below sets it.
 
+initial_condition writes its three components with |, and any of them may be a
+range: `ic=0|1|1.05,2|0|0.5` names two starts and `ic=0:1:0.25|1|1.05` draws a
+line of five along x. The starts ride the batch axis, so an ensemble costs one
+run rather than one run each, and the success figure averages over them.
+
 Each sweep claims the next number from plots/.sweep_counter and writes
 everything it produces into that one directory:
 
     plots/sweep_007/
         manifest.json               # the axes, the constants, the git sha
         success.csv                 # one row per grid point, every parameter
-        success_v_lam.png           # unless -np
+        success_v_th.png            # unless -np
         attractor/                  # one png per grid point
         loss_v_iteration/           # one png per grid point, with -loss
+
+The success figure always plots the success metric against the training window;
+every other parameter the grid varied gets a panel per combination, and a grid
+with more combinations than one page holds becomes a success_v_th/ directory
+instead, a file per value of its outermost parameters. initial_condition is the
+exception: runs differing only in where they started are one line, the mean
+over a band spanning the ensemble.
 
 Filenames carry only the axes the sweep varied — `lam0p100_th1p000.png` — so a
 constant never repeats across every name in the directory; the manifest and the
@@ -58,7 +71,6 @@ from params import (
     csv_value,
     defaults,
     parse_axis,
-    resolve,
     stem,
 )
 
@@ -112,11 +124,11 @@ def latest_sweep_csv():
     return max(found, key=os.path.getmtime)
 
 
-def plot_csv(path, save, x_key=None, panel_key=None):
+def plot_csv(path, save):
     # imported here so a plain sweep doesn't pay for torch and matplotlib
     from figures import plot_success
 
-    plot_success(path, x_key=x_key, panel_key=panel_key, save=save)
+    plot_success(path, save=save)
 
 
 def git_sha():
@@ -212,9 +224,12 @@ def train_group(group, device, dtype, use_graph):
 
     settings = group[0]
     integrator = rk4_step if settings["rk4"] else euler_step
+    # one start per lane, so an ensemble over initial conditions rides the
+    # batch axis like lambda does rather than splitting the grid
+    starts = [values["initial_condition"] for values in group]
 
     w, b, history = train_policy_batched(
-        state0=settings["initial_condition"],
+        state0=starts,
         batch=len(group),
         horizon=[values["train_horizon"] for values in group],
         effort_horizon=settings["plot_horizon"],
@@ -233,7 +248,7 @@ def train_group(group, device, dtype, use_graph):
 
     steps = round(settings["plot_horizon"] / (LYAPUNOV_EXP * DT))
     traj, u = rollout_numpy_batched(
-        settings["initial_condition"], w, b, steps=steps, integrator=integrator
+        starts, w, b, steps=steps, integrator=integrator
     )
 
     return w, b, history, traj, u, success_fraction(traj)
@@ -410,19 +425,6 @@ if __name__ == "__main__":
         default=None,
         help="plot an existing csv instead of sweeping (default: the latest sweep)",
     )
-    parser.add_argument(
-        "-x",
-        "--x_key",
-        default=None,
-        help="parameter on the success plot's x axis (default: the first axis swept)",
-    )
-    parser.add_argument(
-        "-p",
-        "--panel_key",
-        default=None,
-        help="parameter to give one success panel per value (default: the second "
-        "axis swept)",
-    )
 
     flags = parser.add_argument_group(title="Flags")
     flags.add_argument("-s", "--save", action="store_true")
@@ -453,18 +455,8 @@ if __name__ == "__main__":
     flags.add_argument("--dry_run", "--dry-run", action="store_true", dest="dry_run")
     args = parser.parse_args()
 
-    # fail on a typo'd axis name now, not after the whole grid has run
-    for key in (args.x_key, args.panel_key):
-        if key:
-            resolve(key)
-
     if args.success_csv is not None:
-        plot_csv(
-            args.success_csv or latest_sweep_csv(),
-            save=args.save,
-            x_key=args.x_key,
-            panel_key=args.panel_key,
-        )
+        plot_csv(args.success_csv or latest_sweep_csv(), save=args.save)
         sys.exit(0)
 
     axes = build_axes(args.sweep or DEFAULT_AXES)
@@ -605,4 +597,4 @@ if __name__ == "__main__":
     # a finished sweep is usually headless, so write the figure rather than
     # blocking on a window nobody is watching
     if not args.no_plot:
-        plot_csv(csv_path, save=True, x_key=args.x_key, panel_key=args.panel_key)
+        plot_csv(csv_path, save=True)

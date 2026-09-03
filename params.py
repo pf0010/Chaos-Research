@@ -17,6 +17,7 @@ so the name survives \\includegraphics, and an explicit token for every value so
 Nothing here imports torch or matplotlib; sweep.py leans on that.
 """
 
+import itertools
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -89,8 +90,12 @@ PARAMS = (
         _parse_vector,
         lambda v: "-".join(decimal_tag(c) for c in v),
         show=lambda v: f"({','.join(str(c) for c in v)})",
-        sweepable=False,
         nargs=3,
+        # an ensemble of starts costs one run, not one run each: training.py
+        # already expands state0 to (batch, 3), which is a no-op when the
+        # caller hands it one start per lane, and the evaluation rollout
+        # broadcasts the same way
+        batchable=True,
     ),
     Param(
         "learning_rate",
@@ -267,8 +272,61 @@ def frange(start, stop, step):
     return values
 
 
+def parse_range(text, spec):
+    """'0.05:0.15:0.01' -> the inclusive list of values it names."""
+    parts = text.split(":")
+
+    if len(parts) != 3:
+        raise SystemExit(f"expected start:stop:step, got {text!r} in {spec!r}")
+
+    try:
+        start, stop, step = (float(part) for part in parts)
+    except ValueError:
+        raise SystemExit(f"non-numeric range in {spec!r}") from None
+
+    return frange(start, stop, step)
+
+
+def parse_vector_axis(rhs, nargs, spec):
+    """'0:0.5:0.1|1|1.05,2|0|0.5' -> the list of vectors it names.
+
+    A component is either a number or a start:stop:step range, and the ranges
+    within one vector are taken as a product, so a line -- or a plane -- drawn
+    through state space is a single axis rather than one axis per component.
+    Commas join independent vectors, so a handful of literal starts and a swept
+    line can be asked for together.
+    """
+    values = []
+
+    for part in rhs.split(","):
+        if not part.strip():
+            continue
+
+        components = part.split("|")
+
+        if len(components) != nargs:
+            raise SystemExit(
+                f"expected {nargs} components separated by | in {part!r}, "
+                f"got {len(components)}"
+            )
+
+        try:
+            spans = [
+                parse_range(component, spec)
+                if ":" in component
+                else [float(component)]
+                for component in components
+            ]
+        except ValueError:
+            raise SystemExit(f"non-numeric component in {part!r}") from None
+
+        values.extend(itertools.product(*spans))
+
+    return values
+
+
 def parse_axis(spec):
-    """'lam=0.05:0.15:0.01' or 'rk4=0,1' -> (canonical name, [values])."""
+    """'lam=0.05:0.15:0.01', 'rk4=0,1' or 'ic=0:0.5:0.1|1|1.05' -> (name, values)."""
     name, sep, rhs = spec.partition("=")
 
     if not sep or not rhs.strip():
@@ -279,28 +337,29 @@ def parse_axis(spec):
     if not param.sweepable:
         raise SystemExit(f"{param.name} cannot be swept")
 
-    if ":" in rhs:
-        parts = rhs.split(":")
-
-        if len(parts) != 3:
-            raise SystemExit(f"expected NAME=start:stop:step, got {spec!r}")
+    # a vector parameter spells out its own components, so a colon inside one
+    # of them is a range over that component, not over the parameter
+    if param.nargs > 1:
+        values = parse_vector_axis(rhs, param.nargs, spec)
+    else:
+        raw = (
+            parse_range(rhs, spec)
+            if ":" in rhs
+            else [part for part in rhs.split(",") if part.strip()]
+        )
 
         try:
-            start, stop, step = (float(part) for part in parts)
-        except ValueError:
-            raise SystemExit(f"non-numeric range in {spec!r}") from None
-
-        raw = frange(start, stop, step)
-    else:
-        raw = [part for part in rhs.split(",") if part.strip()]
-
-    try:
-        values = [param.parse(value) for value in raw]
-    except ValueError as err:
-        raise SystemExit(f"bad value in {spec!r}: {err}") from None
+            values = [param.parse(value) for value in raw]
+        except ValueError as err:
+            raise SystemExit(f"bad value in {spec!r}: {err}") from None
 
     if not values:
         raise SystemExit(f"{spec!r} produced no values")
+
+    # a grid point asked for twice is trained twice and drawn over itself; the
+    # tag check below would catch it, but blaming the formatter would be a lie
+    if len(set(values)) != len(values):
+        raise SystemExit(f"{spec!r} names the same value more than once")
 
     # a range that steps past its own resolution would name two runs the same
     tags = [param.fmt(value) for value in values]
