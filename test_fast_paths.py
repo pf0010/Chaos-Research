@@ -18,7 +18,13 @@ import torch
 
 from kernels import cuda_available, moment_stats_cuda, moment_stats_numpy
 from lorenz import euler_step, lorenz_rhs, rk4_step, rollout_numpy, rollout_numpy_batched
-from training import BatchedAdam, effort_moments, linear_policy, train_policy_batched
+from training import (
+    BatchedAdam,
+    effort_moments,
+    init_policy_params,
+    linear_policy,
+    train_policy_batched,
+)
 
 CUDA = cuda_available()
 
@@ -176,8 +182,18 @@ def test_batching_does_not_change_the_answer():
         dtype=torch.float64,
     )
 
+    # each lane's random start is fixed up front so its solo run can share it;
+    # lane 3 repeats lane 1 in full, starting law included
+    w0, b0 = (p.detach() for p in init_policy_params(4))
+    w0[3], b0[3] = w0[1], b0[1]
+
     w, b, history = train_policy_batched(
-        batch=4, effort_weight=lams, learning_rate=lrs, use_graph=True, **common
+        batch=4,
+        effort_weight=lams,
+        learning_rate=lrs,
+        use_graph=True,
+        init=(w0, b0),
+        **common,
     )
 
     for i, (lr, lam) in enumerate(zip(lrs, lams)):
@@ -186,6 +202,7 @@ def test_batching_does_not_change_the_answer():
             effort_weight=[lam],
             learning_rate=[lr],
             use_graph=False,
+            init=(w0[i : i + 1], b0[i : i + 1]),
             **common,
         )
 
@@ -226,8 +243,15 @@ def test_mixed_windows_match_their_own_runs():
         dtype=torch.float64,
     )
 
+    w0, b0 = (p.detach() for p in init_policy_params(5))
+
     w, b, _ = train_policy_batched(
-        batch=5, horizon=horizons, effort_weight=lams, use_graph=True, **common
+        batch=5,
+        horizon=horizons,
+        effort_weight=lams,
+        use_graph=True,
+        init=(w0, b0),
+        **common,
     )
 
     for i, (horizon, lam) in enumerate(zip(horizons, lams)):
@@ -236,6 +260,7 @@ def test_mixed_windows_match_their_own_runs():
             horizon=horizon,
             effort_weight=[lam],
             use_graph=False,
+            init=(w0[i : i + 1], b0[i : i + 1]),
             **common,
         )
 
@@ -267,10 +292,16 @@ def test_mixed_starts_match_their_own_runs():
         use_graph=False,
     )
 
-    w, b, _ = train_policy_batched(state0=starts, batch=len(starts), **common)
+    w0, b0 = (p.detach() for p in init_policy_params(len(starts)))
+
+    w, b, _ = train_policy_batched(
+        state0=starts, batch=len(starts), init=(w0, b0), **common
+    )
 
     for i, start in enumerate(starts):
-        w_one, b_one, _ = train_policy_batched(state0=[start], batch=1, **common)
+        w_one, b_one, _ = train_policy_batched(
+            state0=[start], batch=1, init=(w0[i : i + 1], b0[i : i + 1]), **common
+        )
 
         assert (w[i] - w_one[0]).abs().max() < 1e-12, (start, w[i], w_one[0])
         assert (b[i] - b_one[0]).abs().max() < 1e-12, (start, b[i], b_one[0])

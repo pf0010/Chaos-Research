@@ -334,8 +334,9 @@ def plot_loss_gradient_vs_horizon(
 ):
     horizons = np.linspace(0.1, max_horizon, n)
     norms = []
+    # one draw for every horizon, so the curve moves with the window alone
+    params = init_policy_params()
     for horizon in horizons:
-        params = init_policy_params()
         steps = round(horizon / (LYAPUNOV_EXP * DT))
         traj = rollout_torch(
             state0,

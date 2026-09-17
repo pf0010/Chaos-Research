@@ -25,15 +25,21 @@ from params import DEFAULT_EFFORT_WEIGHT
 
 SOFTNESS = 2.0
 U_REF = 60.0
+INIT_SCALE = 0.1
 
 
-def init_policy_params(batch=None, device="cpu", dtype=torch.float64):
+def init_policy_params(batch=None, device="cpu", dtype=torch.float64, scale=INIT_SCALE):
+    """Draw w and b from N(0, scale²), independently per lane.
+
+    Drawn in float64 on the CPU and moved afterwards, so a given torch seed
+    gives the same starting law whatever device or dtype the run lands on.
+    """
     shape = () if batch is None else (batch,)
 
-    w = torch.zeros((*shape, 3), dtype=dtype, device=device, requires_grad=True)
-    b = torch.zeros(shape, dtype=dtype, device=device, requires_grad=True)
+    w = (scale * torch.randn((*shape, 3), dtype=torch.float64)).to(device, dtype)
+    b = (scale * torch.randn(shape, dtype=torch.float64)).to(device, dtype)
 
-    return w, b
+    return w.requires_grad_(), b.requires_grad_()
 
 
 def linear_policy(params, state):
@@ -210,6 +216,7 @@ def train_policy_batched(
     device=None,
     dtype=None,
     use_graph=True,
+    init=None,
 ):
     """Train `batch` independent policies at once.
 
@@ -223,6 +230,9 @@ def train_policy_batched(
     masked back to its own -- which costs max(steps) rather than sum(steps).
     The integrator, the iteration count and the evaluation window still have
     to match across a batch, so those stay separate calls.
+
+    Each lane starts from its own random law (init_policy_params) unless
+    `init` gives the starting (w, b) as a (batch, 3) and a (batch,) array.
 
     Returns (w, b, history), history being (iters, batch, 3) of
     (task, λ·effort, total) -- the same three series the scalar loop recorded.
@@ -279,7 +289,13 @@ def train_policy_batched(
     lam = _as_batch(effort_weight, batch, device, dtype)
     lr = _as_batch(learning_rate, batch, device, dtype)
 
-    w, b = init_policy_params(batch, device=device, dtype=dtype)
+    if init is None:
+        w, b = init_policy_params(batch, device=device, dtype=dtype)
+    else:
+        w, b = (
+            torch.as_tensor(p, device=device, dtype=dtype).clone().requires_grad_()
+            for p in init
+        )
     state0 = (
         torch.as_tensor(np.asarray(state0, dtype=float), device=device, dtype=dtype)
         .expand(batch, 3)
@@ -347,8 +363,11 @@ def _replay_graphed(iteration, iters, params, opt, step_index, warmup=3):
 
     The warmup runs are real training steps -- they have to be, to force the
     Triton compile, the autograd graph and the optimizer state into existence
-    before capture -- so everything they touched is reset before the capture.
+    before capture -- so everything they touched is reset before the capture,
+    the parameters back to the random draw they started from.
     """
+    initial = [p.detach().clone() for p in params]
+
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
 
@@ -359,8 +378,8 @@ def _replay_graphed(iteration, iters, params, opt, step_index, warmup=3):
     torch.cuda.current_stream().wait_stream(stream)
 
     with torch.no_grad():
-        for p in params:
-            p.zero_()
+        for p, p0 in zip(params, initial):
+            p.copy_(p0)
 
     opt.reset()
     step_index.zero_()
