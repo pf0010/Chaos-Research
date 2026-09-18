@@ -12,6 +12,7 @@ import os
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from matplotlib.colors import LogNorm
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 from mpl_toolkits.mplot3d.art3d import Line3DCollection
@@ -34,6 +35,7 @@ from params import (
 )
 from training import (
     SOFTNESS,
+    effort_penalty,
     final_state_sensitivity,
     init_policy_params,
     linear_policy,
@@ -411,6 +413,224 @@ def plot_loss_curve(
 
     print(f"loss: {total[0]:.4f} -> {total[-1]:.4f}   min {total.min():.4f}")
 
+    finish_training_curve(
+        ax.figure,
+        "loss_v_iteration",
+        state0=state0,
+        lr=lr,
+        train_horizon=train_horizon,
+        plot_horizon=plot_horizon,
+        iters=iters,
+        penalize_effort=penalize_effort,
+        effort_weight=effort_weight,
+        integrator=integrator,
+        save=save,
+        out_dir=out_dir,
+        name_keys=name_keys,
+    )
+
+
+def plot_grad_norm_curve(
+    grad_norm,
+    state0=[0, 1, 1.05],
+    lr=0.05,
+    train_horizon=1.0,
+    plot_horizon=100,
+    iters=600,
+    penalize_effort=True,
+    effort_weight=DEFAULT_EFFORT_WEIGHT,
+    integrator=rk4_step,
+    save=False,
+    out_dir=None,
+    name_keys=None,
+):
+    task, penalty, total = np.asarray(grad_norm).T
+    iterations = np.arange(len(total))
+
+    ax = plt.figure(figsize=(9, 6)).add_subplot()
+    ax.plot(iterations, total, color="crimson", linewidth=1.0, label="total")
+    ax.plot(iterations, task, color="tab:blue", linewidth=0.8, label="task")
+
+    # an unpenalized run never differentiates the penalty, so there is no line
+    if penalize_effort:
+        ax.plot(iterations, penalty, color="gray", linewidth=0.8, label="λ·effort")
+
+    # through a chaotic window the norms span orders of magnitude
+    ax.set_yscale("log")
+
+    ax.set_xlabel("iteration")
+    ax.set_ylabel("‖∇‖₂  over (w, b)")
+    ax.set_title("Gradient norms vs. iteration")
+    ax.legend(loc="upper right")
+
+    print(
+        f"grad norm: {total[0]:.4g} -> {total[-1]:.4g}   max {total.max():.4g}   "
+        f"final task {task[-1]:.4g}   λ·effort {penalty[-1]:.4g}"
+    )
+
+    finish_training_curve(
+        ax.figure,
+        "grad_norm_v_iteration",
+        state0=state0,
+        lr=lr,
+        train_horizon=train_horizon,
+        plot_horizon=plot_horizon,
+        iters=iters,
+        penalize_effort=penalize_effort,
+        effort_weight=effort_weight,
+        integrator=integrator,
+        save=save,
+        out_dir=out_dir,
+        name_keys=name_keys,
+    )
+
+
+def plot_state_gradient_through_window(
+    param_history,
+    state0=[0, 1, 1.05],
+    lr=0.05,
+    train_horizon=1.0,
+    plot_horizon=100,
+    iters=600,
+    penalize_effort=True,
+    effort_weight=DEFAULT_EFFORT_WEIGHT,
+    integrator=rk4_step,
+    save=False,
+    out_dir=None,
+    name_keys=None,
+    max_rows=150,
+):
+    """‖∂L/∂s_t‖ at every step of the training window, across training.
+
+    This is the gradient as backpropagation carries it back through the
+    rollout, so chaos shows up as growth from the end of the window towards
+    its start. Each recorded iteration's (w, b) is a lane of one float64
+    rollout -- the lanes are independent, so one backward pass hands every
+    state its own lane's gradient. `max_rows` strides the iterations to keep
+    the saved activations bounded.
+    """
+    seen = np.asarray(param_history, dtype=float)
+    stride = max(1, math.ceil(len(seen) / max_rows))
+    rows = np.arange(0, len(seen), stride)
+
+    w = torch.as_tensor(seen[rows, :3])
+    b = torch.as_tensor(seen[rows, 3])
+    steps = round(train_horizon / (LYAPUNOV_EXP * DT))
+
+    # the same objective training differentiated: a frozen-moment penalty
+    # never reaches the states, a pathwise one (equal windows) does
+    pathwise = penalize_effort and steps == round(plot_horizon / (LYAPUNOV_EXP * DT))
+
+    state = (
+        torch.as_tensor(np.asarray(state0, dtype=float))
+        .expand(len(rows), 3)
+        .clone()
+        .requires_grad_()
+    )
+    states = [state]
+
+    for _ in range(steps):
+        state, _ = integrator(state, lambda s: linear_policy((w, b), s))
+        state.retain_grad()
+        states.append(state)
+
+    traj = torch.stack(states)
+    loss = task_loss(traj)
+
+    if pathwise:
+        loss = loss + effort_weight * effort_penalty(traj, (w, b))
+
+    loss.sum().backward()
+
+    # (steps+1, rows): the full gradient reaching each state, every later use
+    # of it included, not just its own term in the loss
+    adjoint = torch.stack([s.grad for s in states]).norm(dim=-1).numpy()
+    times = np.arange(steps + 1) * DT * LYAPUNOV_EXP
+
+    fig, (heat, lines) = plt.subplots(1, 2, figsize=(15, 6))
+
+    positive = adjoint[adjoint > 0]
+    color_norm = LogNorm(vmin=max(positive.min(), positive.max() * 1e-8), vmax=positive.max())
+    mesh = heat.pcolormesh(
+        times, rows, adjoint.T, norm=color_norm, cmap="viridis", shading="nearest"
+    )
+    fig.colorbar(mesh, ax=heat, label="‖∂L/∂s_t‖₂")
+
+    heat.set_xlabel("time in training window (Lyapunov times)")
+    heat.set_ylabel("iteration")
+    heat.set_title("Gradient w.r.t. the state, across training")
+
+    picks = np.unique(np.linspace(0, len(rows) - 1, 5).round().astype(int))
+    cmap = plt.colormaps["viridis"]
+
+    for j, i in enumerate(picks):
+        lines.plot(
+            times,
+            adjoint[:, i],
+            color=cmap(j / max(len(picks) - 1, 1)),
+            linewidth=1.0,
+            label=f"iteration {rows[i]}",
+        )
+
+    # what an uncontrolled perturbation would do: one e-fold per Lyapunov
+    # time, run backwards from the end of the window. Only its slope means
+    # anything -- the gradient also grows backwards because every later
+    # step's loss term piles onto it
+    lines.plot(
+        times,
+        adjoint[-1, 0] * np.exp(times[-1] - times),
+        color="gray",
+        linestyle="--",
+        linewidth=0.8,
+        label="slope of e^(T−t)  (Lyapunov growth)",
+    )
+
+    lines.set_yscale("log")
+    lines.set_ylim(color_norm.vmin, color_norm.vmax * 10)
+    lines.set_xlabel("time in training window (Lyapunov times)")
+    lines.set_ylabel("‖∂L/∂s_t‖₂")
+    lines.set_title("Selected iterations")
+    lines.legend(loc="upper right")
+
+    for i in (0, len(rows) - 1):
+        print(
+            f"iteration {rows[i]}: ‖∂L/∂s_0‖ {adjoint[0, i]:.3g}   "
+            f"‖∂L/∂s_T‖ {adjoint[-1, i]:.3g}"
+        )
+
+    finish_training_curve(
+        fig,
+        "state_gradient_v_time",
+        state0=state0,
+        lr=lr,
+        train_horizon=train_horizon,
+        plot_horizon=plot_horizon,
+        iters=iters,
+        penalize_effort=penalize_effort,
+        effort_weight=effort_weight,
+        integrator=integrator,
+        save=save,
+        out_dir=out_dir,
+        name_keys=name_keys,
+    )
+
+
+def finish_training_curve(
+    fig,
+    subdir,
+    state0,
+    lr,
+    train_horizon,
+    plot_horizon,
+    iters,
+    penalize_effort,
+    effort_weight,
+    integrator,
+    save,
+    out_dir,
+    name_keys,
+):
+    """Caption a per-iteration figure, then save it under `subdir` or show it."""
     values = run_values(
         initial_condition=tuple(state0),
         learning_rate=lr,
@@ -423,14 +643,14 @@ def plot_loss_curve(
     )
     caption = settings_caption(**shown(values), dt=DT)
 
-    ax.figure.tight_layout(rect=(0, 0.04, 1, 1))
-    add_caption(ax.figure, caption)
+    fig.tight_layout(rect=(0, 0.04, 1, 1))
+    add_caption(fig, caption)
 
     if save:
-        # same stem as the attractor plots, so the two directories line up
+        # same stem as the attractor plots, so the directories line up
         save_figure(
-            ax.figure,
-            os.path.join(run_output_dir(iters, out_dir), "loss_v_iteration"),
+            fig,
+            os.path.join(run_output_dir(iters, out_dir), subdir),
             values,
             name_keys or SWEEPABLE,
         )

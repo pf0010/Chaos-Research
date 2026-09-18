@@ -187,7 +187,7 @@ def test_batching_does_not_change_the_answer():
     w0, b0 = (p.detach() for p in init_policy_params(4))
     w0[3], b0[3] = w0[1], b0[1]
 
-    w, b, history = train_policy_batched(
+    w, b, history, grad_norm = train_policy_batched(
         batch=4,
         effort_weight=lams,
         learning_rate=lrs,
@@ -197,7 +197,7 @@ def test_batching_does_not_change_the_answer():
     )
 
     for i, (lr, lam) in enumerate(zip(lrs, lams)):
-        w_one, b_one, history_one = train_policy_batched(
+        w_one, b_one, history_one, grad_norm_one = train_policy_batched(
             batch=1,
             effort_weight=[lam],
             learning_rate=[lr],
@@ -209,6 +209,8 @@ def test_batching_does_not_change_the_answer():
         assert (w[i] - w_one[0]).abs().max() < 1e-12, (i, w[i], w_one[0])
         assert (b[i] - b_one[0]).abs().max() < 1e-12, (i, b[i], b_one[0])
         assert np.abs(history[:, i] - history_one[:, 0]).max() < 1e-15
+        # the graphed lane must record the same norms the eager run did
+        assert np.allclose(grad_norm[:, i], grad_norm_one[:, 0], rtol=1e-12, atol=0)
 
     # two lanes given identical settings do the identical arithmetic, so these
     # have no reassociation to excuse a difference and must match exactly
@@ -245,7 +247,7 @@ def test_mixed_windows_match_their_own_runs():
 
     w0, b0 = (p.detach() for p in init_policy_params(5))
 
-    w, b, _ = train_policy_batched(
+    w, b, _, _ = train_policy_batched(
         batch=5,
         horizon=horizons,
         effort_weight=lams,
@@ -255,7 +257,7 @@ def test_mixed_windows_match_their_own_runs():
     )
 
     for i, (horizon, lam) in enumerate(zip(horizons, lams)):
-        w_one, b_one, _ = train_policy_batched(
+        w_one, b_one, _, _ = train_policy_batched(
             batch=1,
             horizon=horizon,
             effort_weight=[lam],
@@ -294,17 +296,27 @@ def test_mixed_starts_match_their_own_runs():
 
     w0, b0 = (p.detach() for p in init_policy_params(len(starts)))
 
-    w, b, _ = train_policy_batched(
+    w, b, _, grad_norm = train_policy_batched(
         state0=starts, batch=len(starts), init=(w0, b0), **common
     )
 
     for i, start in enumerate(starts):
-        w_one, b_one, _ = train_policy_batched(
+        w_one, b_one, _, grad_norm_one = train_policy_batched(
             state0=[start], batch=1, init=(w0[i : i + 1], b0[i : i + 1]), **common
         )
 
         assert (w[i] - w_one[0]).abs().max() < 1e-12, (start, w[i], w_one[0])
         assert (b[i] - b_one[0]).abs().max() < 1e-12, (start, b[i], b_one[0])
+        # summing the lanes' losses must not leak one lane's gradient into another
+        assert np.allclose(grad_norm[:, i], grad_norm_one[:, 0], rtol=1e-12, atol=0)
+
+    # the total is the norm of the sum of the other two, so it has to sit
+    # between their difference and their sum -- a swapped column would not
+    task_norm, penalty_norm, total_norm = np.moveaxis(grad_norm, -1, 0)
+    slack = 1e-12 * (task_norm + penalty_norm)
+    assert (total_norm <= task_norm + penalty_norm + slack).all()
+    assert (total_norm >= np.abs(task_norm - penalty_norm) - slack).all()
+    assert (penalty_norm[1:] > 0).all()
 
     # the evaluation rollout broadcasts state0 against w rather than expanding
     # it, so it is a separate place the starts could collapse

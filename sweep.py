@@ -15,6 +15,7 @@ same number either way. See kernels.py.
     python sweep.py -sw "ic=0:1:0.25|1|1.05"    # an ensemble of starts
     python sweep.py -j 4                        # cap at 4 figure-drawing workers
     python sweep.py -loss                       # also save a loss curve per point
+    python sweep.py -gn                         # and/or a gradient-norm curve
     python sweep.py -np                         # skip the success plot at the end
     python sweep.py -sc                         # just replot the latest sweep
     python sweep.py --device cpu                # or --fp64, or --no-graph
@@ -38,6 +39,7 @@ everything it produces into that one directory:
         success_v_th.png            # unless -np
         attractor/                  # one png per grid point
         loss_v_iteration/           # one png per grid point, with -loss
+        grad_norm_v_iteration/      # one png per grid point, with -gn
 
 The success figure always plots the success metric against the training window;
 every other parameter the grid varied gets a panel per combination, and a grid
@@ -212,7 +214,7 @@ def group_grid(grid):
 
 
 def train_group(group, device, dtype, use_graph):
-    """Train one batch and evaluate it, returning (w, b, history, traj, u, success).
+    """Train one batch and evaluate it, returning (w, b, history, grad_norm, traj, u, success).
 
     The evaluation rollout is batched too, and it is the one the figures and
     the success metric are read off, so every point in the group is measured
@@ -228,7 +230,7 @@ def train_group(group, device, dtype, use_graph):
     # batch axis like lambda does rather than splitting the grid
     starts = [values["initial_condition"] for values in group]
 
-    w, b, history = train_policy_batched(
+    w, b, history, grad_norm = train_policy_batched(
         state0=starts,
         batch=len(group),
         horizon=[values["train_horizon"] for values in group],
@@ -251,7 +253,7 @@ def train_group(group, device, dtype, use_graph):
         starts, w, b, steps=steps, integrator=integrator
     )
 
-    return w, b, history, traj, u, success_fraction(traj)
+    return w, b, history, grad_norm, traj, u, success_fraction(traj)
 
 
 def draw_point(job):
@@ -259,9 +261,21 @@ def draw_point(job):
     import contextlib
     import io
 
-    from figures import plot_loss_curve, plot_run_summary
+    from figures import plot_grad_norm_curve, plot_loss_curve, plot_run_summary
 
-    values, w, b, history, traj, u, sweep_dir, name_keys, loss_curve = job
+    (
+        values,
+        w,
+        b,
+        history,
+        grad_norm,
+        traj,
+        u,
+        sweep_dir,
+        name_keys,
+        loss_curve,
+        grad_norm_curve,
+    ) = job
 
     import torch
 
@@ -285,6 +299,9 @@ def draw_point(job):
     with contextlib.redirect_stdout(io.StringIO()):
         if loss_curve:
             plot_loss_curve(history, **shared)
+
+        if grad_norm_curve:
+            plot_grad_norm_curve(grad_norm, **shared)
 
         plot_run_summary(params, traj=traj, u=u, **shared)
 
@@ -447,6 +464,12 @@ if __name__ == "__main__":
         help="also save a loss-vs-iteration plot for every grid point",
     )
     flags.add_argument(
+        "-gn",
+        "--grad_norm_curve",
+        action="store_true",
+        help="also save a gradient-norm-vs-iteration plot for every grid point",
+    )
+    flags.add_argument(
         "-npe",
         "--no_penalize_effort",
         action="store_true",
@@ -551,7 +574,7 @@ if __name__ == "__main__":
 
     for n, group in enumerate(groups, start=1):
         at = time.monotonic()
-        w, b, history, traj, u, success = train_group(group, device, dtype, use_graph)
+        w, b, history, grad_norm, traj, u, success = train_group(group, device, dtype, use_graph)
         elapsed = time.monotonic() - at
 
         held = "  ".join(
@@ -572,11 +595,13 @@ if __name__ == "__main__":
                     w[i],
                     b[i],
                     history[:, i, :],
+                    grad_norm[:, i, :],
                     traj[:, i, :],
                     u[:, i],
                     sweep_dir,
                     name_keys,
                     args.loss_curve,
+                    args.grad_norm_curve,
                 )
             )
 

@@ -2,6 +2,8 @@
 
     python run_control.py -th 1.0 -i 600       # train, then show the summary
     python run_control.py -loss -s             # also save a loss curve
+    python run_control.py -gn -s               # and a gradient norm vs. iteration
+    python run_control.py -sg -s               # ∂L/∂state through the window
     python run_control.py -lgh 8               # loss-gradient vs. horizon
 
 Plotting a finished sweep is sweep.py's job: `python sweep.py -sc`.
@@ -14,7 +16,13 @@ The two share params.py, so a flag added below should be added there too.
 
 import argparse
 
-from figures import plot_loss_curve, plot_loss_gradient_vs_horizon, plot_run_summary
+from figures import (
+    plot_grad_norm_curve,
+    plot_loss_curve,
+    plot_loss_gradient_vs_horizon,
+    plot_run_summary,
+    plot_state_gradient_through_window,
+)
 from lorenz import euler_step, rk4_step
 from params import DEFAULT_EFFORT_WEIGHT, SWEEPABLE, resolve
 from training import train_policy
@@ -84,6 +92,18 @@ if __name__ == "__main__":
         help="integrate with forward euler instead of the default rk4",
     )
     flags.add_argument("-loss", "--loss_curve", action="store_true")
+    flags.add_argument(
+        "-gn",
+        "--grad_norm_curve",
+        action="store_true",
+        help="also plot the gradient norm against iteration",
+    )
+    flags.add_argument(
+        "-sg",
+        "--state_gradient",
+        action="store_true",
+        help="also plot the gradient w.r.t. each state in the window, across training",
+    )
     args = parser.parse_args()
 
     integrator = euler_step if args.euler else rk4_step
@@ -104,6 +124,8 @@ if __name__ == "__main__":
         import torch
 
         history = []
+        grad_norms = []
+        param_history = [] if args.state_gradient else None
         params = train_policy(
             state0=args.initial_condition,
             lr=args.learning_rate,
@@ -114,6 +136,8 @@ if __name__ == "__main__":
             effort_weight=args.effort_weight,
             integrator=integrator,
             history=history,
+            grad_norms=grad_norms,
+            param_history=param_history,
             device=args.device,
             dtype=torch.float64 if args.fp64 else None,
             use_graph=not args.no_graph,
@@ -122,6 +146,38 @@ if __name__ == "__main__":
         if args.loss_curve:
             plot_loss_curve(
                 history,
+                state0=args.initial_condition,
+                lr=args.learning_rate,
+                train_horizon=args.train_horizon,
+                plot_horizon=args.plot_horizon,
+                iters=args.iters,
+                penalize_effort=penalize_effort,
+                effort_weight=args.effort_weight,
+                integrator=integrator,
+                save=args.save,
+                out_dir=args.out_dir,
+                name_keys=name_keys,
+            )
+
+        if args.grad_norm_curve:
+            plot_grad_norm_curve(
+                grad_norms,
+                state0=args.initial_condition,
+                lr=args.learning_rate,
+                train_horizon=args.train_horizon,
+                plot_horizon=args.plot_horizon,
+                iters=args.iters,
+                penalize_effort=penalize_effort,
+                effort_weight=args.effort_weight,
+                integrator=integrator,
+                save=args.save,
+                out_dir=args.out_dir,
+                name_keys=name_keys,
+            )
+
+        if args.state_gradient:
+            plot_state_gradient_through_window(
+                param_history,
                 state0=args.initial_condition,
                 lr=args.learning_rate,
                 train_horizon=args.train_horizon,

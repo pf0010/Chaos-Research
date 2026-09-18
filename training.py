@@ -217,6 +217,7 @@ def train_policy_batched(
     dtype=None,
     use_graph=True,
     init=None,
+    record_params=False,
 ):
     """Train `batch` independent policies at once.
 
@@ -234,8 +235,13 @@ def train_policy_batched(
     Each lane starts from its own random law (init_policy_params) unless
     `init` gives the starting (w, b) as a (batch, 3) and a (batch,) array.
 
-    Returns (w, b, history), history being (iters, batch, 3) of
-    (task, λ·effort, total) -- the same three series the scalar loop recorded.
+    Returns (w, b, history, grad_norm), history being (iters, batch, 3) of
+    (task, λ·effort, total) -- the same three series the scalar loop recorded --
+    and grad_norm (iters, batch, 3) the 2-norms of each lane's gradient in
+    (w, b) from the same three terms, taken before the optimizer step. An
+    unpenalized run trains on the task alone, so its λ·effort column is zero.
+    With `record_params` a fifth element follows: (iters, batch, 4) of
+    (w₁, w₂, w₃, b) as they stood when each iteration's gradient was taken.
     """
     device = resolve_device(device)
     dtype = dtype if dtype is not None else default_dtype(device)
@@ -304,6 +310,10 @@ def train_policy_batched(
 
     opt = BatchedAdam([w, b], [lr.unsqueeze(-1), lr])
     history = torch.zeros(iters, batch, 3, device=device, dtype=dtype)
+    grad_norm = torch.zeros(iters, batch, 3, device=device, dtype=dtype)
+    # recorded whether or not it is asked for, so the captured graph is the
+    # same either way; four numbers a lane is nothing next to the rollout
+    params_seen = torch.zeros(iters, batch, 4, device=device, dtype=dtype)
     step_index = torch.zeros(1, dtype=torch.long, device=device)
 
     def iteration():
@@ -330,9 +340,38 @@ def train_policy_batched(
         penalty = lam * effort
         loss = task + penalty if penalize_effort else task
 
+        def norm(grad_w, grad_b):
+            return (grad_w.square().sum(-1) + grad_b.square()).sqrt()
+
         # the policies are independent, so the sum hands each element exactly
-        # the gradient it would have got from its own backward pass
-        loss.sum().backward()
+        # the gradient it would have got from its own backward pass. The two
+        # terms go back separately so each one's norm can be recorded; the
+        # pathwise penalty shares the rollout, so that graph has to survive
+        task.sum().backward(retain_graph=penalize_effort and not use_moments)
+        task_norm = norm(w.grad, b.grad)
+
+        if penalize_effort:
+            penalty_w, penalty_b = torch.autograd.grad(penalty.sum(), (w, b))
+            penalty_norm = norm(penalty_w, penalty_b)
+
+            # added in place rather than assigned, so .grad keeps its identity
+            # for the graph
+            w.grad.add_(penalty_w)
+            b.grad.add_(penalty_b)
+        else:
+            penalty_norm = torch.zeros_like(task_norm)
+
+        # recorded in place, like history, so the graphed path never syncs
+        grad_norm.index_copy_(
+            0,
+            step_index,
+            torch.stack((task_norm, penalty_norm, norm(w.grad, b.grad)), dim=-1)
+            .detach()
+            .unsqueeze(0),
+        )
+        params_seen.index_copy_(
+            0, step_index, torch.cat((w, b.unsqueeze(-1)), -1).detach().unsqueeze(0)
+        )
 
         opt.step(step_index + 1)
 
@@ -350,7 +389,9 @@ def train_policy_batched(
         for _ in range(iters):
             iteration()
 
-    return w.detach(), b.detach(), history.cpu().numpy()
+    recorded = (w.detach(), b.detach(), history.cpu().numpy(), grad_norm.cpu().numpy())
+
+    return (*recorded, params_seen.cpu().numpy()) if record_params else recorded
 
 
 def _replay_graphed(iteration, iters, params, opt, step_index, warmup=3):
@@ -406,13 +447,20 @@ def train_policy(
     penalize_effort=True,
     integrator=rk4_step,
     history=None,
+    grad_norms=None,
+    param_history=None,
     verbose=True,
     device=None,
     dtype=None,
     use_graph=True,
 ):
-    """One policy, as a batch of one. `history`, if given, collects the triples."""
-    w, b, recorded = train_policy_batched(
+    """One policy, as a batch of one.
+
+    `history`, if given, collects the loss triples; `grad_norms` the matching
+    gradient-norm triples; `param_history` the (w₁, w₂, w₃, b) each iteration
+    took its gradient at.
+    """
+    w, b, recorded, recorded_norms, *recorded_params = train_policy_batched(
         state0=state0,
         batch=1,
         horizon=horizon,
@@ -425,10 +473,17 @@ def train_policy(
         device=device,
         dtype=dtype,
         use_graph=use_graph,
+        record_params=param_history is not None,
     )
 
     if history is not None:
         history.extend(tuple(row) for row in recorded[:, 0, :])
+
+    if grad_norms is not None:
+        grad_norms.extend(tuple(row) for row in recorded_norms[:, 0, :])
+
+    if param_history is not None:
+        param_history.extend(tuple(row) for row in recorded_params[0][:, 0, :])
 
     if verbose:
         # read back off the recorded history rather than printing inside the
