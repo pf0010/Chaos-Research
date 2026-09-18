@@ -1,14 +1,24 @@
-"""Train a feedback law on the Lorenz system and plot the result.
+"""Receding-horizon control of the Lorenz system, and plots of the result.
 
-    python run_control.py -th 1.0 -i 600       # train, then show the summary
+    python run_control.py -th 1 -ph 10 -i 100  # 10 windows of 1 LT, random start
+    python run_control.py -ic 0 1 1.05         # from a given start instead
+    python run_control.py -seed 3              # or from a reproducible random one
     python run_control.py -loss -s             # also save a loss curve
     python run_control.py -gn -s               # and a gradient norm vs. iteration
     python run_control.py -sg -s               # ∂L/∂state through the window
     python run_control.py -lgh 8               # loss-gradient vs. horizon
 
+The projected horizon -ph is cut into windows of -th Lyapunov times. Each
+window trains its own feedback law for -i iterations from where the previous
+window's law left the system, starting from that law; the trajectory stitched
+from those windows is what is scored and drawn.
+
+The start is -ic if given, otherwise a random point on the attractor drawn from
+-seed (itself drawn and printed when not given, so any run can be repeated).
+
 Plotting a finished sweep is sweep.py's job: `python sweep.py -sc`.
 
-This is the single-run door: one policy, trained as a batch of one. A grid no
+This is the single-run door: one run, trained as a batch of one. A grid no
 longer comes through here -- sweep.py calls the batched trainer directly, since
 running the points as separate processes is exactly what made a sweep slow.
 The two share params.py, so a flag added below should be added there too.
@@ -24,7 +34,7 @@ from figures import (
     plot_state_gradient_through_window,
 )
 from lorenz import euler_step, rk4_step
-from params import DEFAULT_EFFORT_WEIGHT, SWEEPABLE, resolve
+from params import DEFAULT_EFFORT_WEIGHT, SWEEPABLE, resolve, resolve_start
 from training import train_policy
 
 if __name__ == "__main__":
@@ -34,8 +44,16 @@ if __name__ == "__main__":
         "--initial_condition",
         nargs=3,
         type=float,
-        default=[0, 1, 1.05],
+        default=None,
         metavar=("X", "Y", "Z"),
+        help="start here (default: a random point on the attractor)",
+    )
+    parser.add_argument(
+        "-seed",
+        "--seed",
+        type=int,
+        default=None,
+        help="seed for the random start (default: drawn, and printed)",
     )
     parser.add_argument("-lr", "--learning_rate", type=float, default=0.05)
     parser.add_argument("-th", "--train_horizon", type=float, default=1)
@@ -116,92 +134,67 @@ if __name__ == "__main__":
 
     if args.loss_gradient_horizon:
         plot_loss_gradient_vs_horizon(
-            state0=args.initial_condition,
+            state0=args.initial_condition or [0, 1, 1.05],
             max_horizon=args.loss_gradient_horizon,
             integrator=integrator,
         )
     else:
         import torch
 
-        history = []
-        grad_norms = []
-        param_history = [] if args.state_gradient else None
-        params = train_policy(
-            state0=args.initial_condition,
+        state0, seed = resolve_start(
+            {"initial_condition": args.initial_condition, "seed": args.seed}
+        )
+        x, y, z = state0
+        print(
+            f"start ({x:+.3f}, {y:+.3f}, {z:+.3f})  "
+            + ("[given]" if seed is None else f"[random, seed {seed}]")
+        )
+
+        run = train_policy(
+            state0=state0,
             lr=args.learning_rate,
             horizon=args.train_horizon,
-            effort_horizon=args.plot_horizon,
+            total_horizon=args.plot_horizon,
             iters=args.iters,
             penalize_effort=penalize_effort,
             effort_weight=args.effort_weight,
             integrator=integrator,
-            history=history,
-            grad_norms=grad_norms,
-            param_history=param_history,
+            record_params=args.state_gradient,
             device=args.device,
             dtype=torch.float64 if args.fp64 else None,
             use_graph=not args.no_graph,
         )
 
-        if args.loss_curve:
-            plot_loss_curve(
-                history,
-                state0=args.initial_condition,
-                lr=args.learning_rate,
-                train_horizon=args.train_horizon,
-                plot_horizon=args.plot_horizon,
-                iters=args.iters,
-                penalize_effort=penalize_effort,
-                effort_weight=args.effort_weight,
-                integrator=integrator,
-                save=args.save,
-                out_dir=args.out_dir,
-                name_keys=name_keys,
-            )
-
-        if args.grad_norm_curve:
-            plot_grad_norm_curve(
-                grad_norms,
-                state0=args.initial_condition,
-                lr=args.learning_rate,
-                train_horizon=args.train_horizon,
-                plot_horizon=args.plot_horizon,
-                iters=args.iters,
-                penalize_effort=penalize_effort,
-                effort_weight=args.effort_weight,
-                integrator=integrator,
-                save=args.save,
-                out_dir=args.out_dir,
-                name_keys=name_keys,
-            )
-
-        if args.state_gradient:
-            plot_state_gradient_through_window(
-                param_history,
-                state0=args.initial_condition,
-                lr=args.learning_rate,
-                train_horizon=args.train_horizon,
-                plot_horizon=args.plot_horizon,
-                iters=args.iters,
-                penalize_effort=penalize_effort,
-                effort_weight=args.effort_weight,
-                integrator=integrator,
-                save=args.save,
-                out_dir=args.out_dir,
-                name_keys=name_keys,
-            )
-
-        plot_run_summary(
-            params,
-            state0=args.initial_condition,
+        shared = dict(
+            state0=state0,
+            seed=seed,
             lr=args.learning_rate,
             train_horizon=args.train_horizon,
             plot_horizon=args.plot_horizon,
             iters=args.iters,
             penalize_effort=penalize_effort,
-            save=args.save,
             effort_weight=args.effort_weight,
             integrator=integrator,
+            save=args.save,
             out_dir=args.out_dir,
             name_keys=name_keys,
+        )
+
+        if args.loss_curve:
+            plot_loss_curve(run.history, **shared)
+
+        if args.grad_norm_curve:
+            plot_grad_norm_curve(run.grad_norm, **shared)
+
+        if args.state_gradient:
+            plot_state_gradient_through_window(
+                run.params_seen, starts=run.starts, **shared
+            )
+
+        # scored and drawn on the stitched trajectory: law k over window k
+        plot_run_summary(
+            (torch.as_tensor(run.w[-1]), torch.as_tensor(run.b[-1])),
+            traj=run.traj,
+            u=run.u,
+            **shared,
         )

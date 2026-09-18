@@ -4,6 +4,11 @@ The policy is a linear feedback law u = w·s + b, trained by differentiating
 straight through the integrator, so the training window is limited by how far
 the gradient survives the attractor's exponential stretching.
 
+That limit is why control is receding-horizon (train_receding_horizon): the
+projected horizon is cut into short windows, each window trains its own law
+from where the previous window's law left the system, and the sequence of
+laws is the controller. The gradient only ever has to survive one window.
+
 Everything here carries an optional leading batch axis: w is (B, 3), b is (B,),
 and the objectives reduce over time only, returning one number per policy. B
 independent policies then train in one set of kernels instead of B sets, which
@@ -16,14 +21,16 @@ is kept because a run can still ask for the task term alone (`-npe`, `reg=0`)
 and compare the two.
 """
 
+from typing import NamedTuple, Optional
+
 import numpy as np
 import torch
 
 from kernels import default_dtype, moment_stats, resolve_device
-from lorenz import DT, LYAPUNOV_EXP, rk4_step, rollout_torch
+from lorenz import DT, LYAPUNOV_EXP, rk4_step, rollout_numpy_batched, rollout_torch
 from params import DEFAULT_EFFORT_WEIGHT
 
-SOFTNESS = 2.0
+SOFTNESS = 2
 U_REF = 60.0
 INIT_SCALE = 0.1
 
@@ -436,35 +443,214 @@ def _replay_graphed(iteration, iters, params, opt, step_index, warmup=3):
     torch.cuda.synchronize()
 
 
+class RecedingRun(NamedTuple):
+    """What a receding-horizon run hands back.
+
+    The controller is the sequence of laws, one per window, so `w` and `b` carry
+    a window axis in front of the batch axis. `traj` and `u` are the trajectory
+    stitched from those windows -- law k applied over window k -- and are what a
+    run is scored and drawn on. `history` and `grad_norm` are every window's
+    training records end to end. A lane whose windows ran out before the
+    batch's did (a longer window in a sweep) is padded past `windows[i]` with
+    its last law frozen; `lane(i)` cuts that padding off.
+    """
+
+    w: np.ndarray  # (N, B, 3)
+    b: np.ndarray  # (N, B)
+    traj: np.ndarray  # (steps+1, B, 3)
+    u: np.ndarray  # (steps+1, B)
+    history: np.ndarray  # (N·iters, B, 3)
+    grad_norm: np.ndarray  # (N·iters, B, 3)
+    starts: np.ndarray  # (N, B, 3), where each window began
+    windows: np.ndarray  # (B,), how many windows each lane actually ran
+    params_seen: Optional[np.ndarray]  # (N·iters, B, 4), with record_params
+
+    def lane(self, i):
+        """Lane i alone, its padding dropped: every array loses the batch axis."""
+        n = int(self.windows[i])
+        rows = n * len(self.history) // len(self.w)
+
+        return RecedingRun(
+            w=self.w[:n, i],
+            b=self.b[:n, i],
+            traj=self.traj[:, i],
+            u=self.u[:, i],
+            history=self.history[:rows, i],
+            grad_norm=self.grad_norm[:rows, i],
+            starts=self.starts[:n, i],
+            windows=n,
+            params_seen=None if self.params_seen is None else self.params_seen[:rows, i],
+        )
+
+
+def train_receding_horizon(
+    state0=(0, 1, 1.05),
+    batch=1,
+    window=1.0,
+    total_horizon=10.0,
+    iters=600,
+    learning_rate=0.05,
+    effort_weight=DEFAULT_EFFORT_WEIGHT,
+    penalize_effort=True,
+    integrator=rk4_step,
+    device=None,
+    dtype=None,
+    use_graph=True,
+    init=None,
+    record_params=False,
+    verbose=False,
+):
+    """Receding-horizon control: a law per window, each trained from where the last ended.
+
+    `total_horizon` is split into back-to-back windows of `window` Lyapunov
+    times, the last one shorter if the two don't divide. Window k trains its own
+    (w, b) over that window alone -- task and effort both, pathwise -- starting
+    from the state window k-1 ended in and from window k-1's law. Only the
+    first window starts from a random law, and Adam starts afresh every window.
+    The trained law is then applied over its window to find where the next one
+    starts: rolled out with the law as it finished, not as it stood at the last
+    gradient, which is one Adam step behind.
+
+    `state0`, `learning_rate`, `effort_weight` and `window` may each be per
+    lane, as in train_policy_batched. A lane with a longer window runs out of
+    windows first; it then sits out the rest with a learning rate of zero,
+    which leaves its law exactly where it was.
+    """
+    unit = LYAPUNOV_EXP * DT
+    windows_lt = np.broadcast_to(np.asarray(window, dtype=float), (batch,))
+    # in steps rather than Lyapunov times, so the windows tile the horizon
+    # exactly instead of drifting by a rounding error each
+    seg = np.array([round(h / unit) for h in windows_lt])
+    total = round(total_horizon / unit)
+
+    if (seg < 1).any() or total < 1:
+        raise ValueError("the window and the total horizon must each be a step or more")
+
+    windows = -(-total // seg)
+    n = int(windows.max())
+    lr = np.broadcast_to(np.asarray(learning_rate, dtype=float), (batch,))
+
+    current = np.broadcast_to(np.asarray(state0, dtype=float), (batch, 3)).copy()
+    traj = np.empty((total + 1, batch, 3))
+    u = np.empty((total + 1, batch))
+    traj[0] = current
+
+    laws_w = np.empty((n, batch, 3))
+    laws_b = np.empty((n, batch))
+    starts = np.empty((n, batch, 3))
+    histories, norms, seen = [], [], []
+
+    for k in range(n):
+        offset = k * seg
+        live = k < windows
+        # a finished lane still needs some window to sit in; its own does
+        steps = np.where(live, np.minimum(seg, total - offset), seg)
+        starts[k] = current
+
+        w, b, history, grad_norm, *params_seen = train_policy_batched(
+            state0=current,
+            batch=batch,
+            horizon=steps * unit,
+            effort_horizon=None,
+            iters=iters,
+            learning_rate=np.where(live, lr, 0.0),
+            effort_weight=effort_weight,
+            penalize_effort=penalize_effort,
+            integrator=integrator,
+            device=device,
+            dtype=dtype,
+            use_graph=use_graph,
+            init=init,
+            record_params=record_params,
+        )
+
+        w = w.cpu().double().numpy()
+        b = b.cpu().double().numpy()
+        laws_w[k], laws_b[k] = w, b
+        init = (w, b)
+
+        histories.append(history)
+        norms.append(grad_norm)
+        seen.extend(params_seen)
+
+        # apply the law over its window. float64 on the cpu like every other
+        # rollout that is scored, whatever precision the training ran in
+        piece, controls = rollout_numpy_batched(
+            current, w, b, steps=int(steps[live].max()), integrator=integrator
+        )
+
+        for i in np.flatnonzero(live):
+            start, length = offset[i], steps[i]
+
+            traj[start + 1 : start + length + 1, i] = piece[1 : length + 1, i]
+            # the control at a window's first state is that window's law's:
+            # it is the one acting from there
+            u[start : start + length, i] = controls[:length, i]
+            current[i] = piece[length, i]
+
+        if verbose:
+            _log_window(k, n, starts[k], history, w, b, live)
+
+    # the last state's control is never applied, but the figures plot it
+    last = windows - 1
+    lanes = np.arange(batch)
+    u[total] = (traj[total] * laws_w[last, lanes]).sum(-1) + laws_b[last, lanes]
+
+    return RecedingRun(
+        w=laws_w,
+        b=laws_b,
+        traj=traj,
+        u=u,
+        history=np.concatenate(histories),
+        grad_norm=np.concatenate(norms),
+        starts=starts,
+        windows=windows,
+        params_seen=np.concatenate(seen) if record_params else None,
+    )
+
+
+def _log_window(k, n, starts, history, w, b, live):
+    # read off the recorded history once the window is done, which on the
+    # graphed path is the only way that doesn't sync the device per iteration
+    first, last = history[0, :, 2], history[-1, :, 2]
+
+    if len(live) == 1:
+        x, y, z = starts[0]
+        print(
+            f"window {k + 1:3d}/{n}  start ({x:+7.2f}, {y:+7.2f}, {z:+6.2f})  "
+            f"loss {first[0]:.4f} -> {last[0]:.4f}   "
+            f"w {w[0].round(3)}  b {b[0]:+.3f}",
+            flush=True,
+        )
+    else:
+        print(
+            f"window {k + 1:3d}/{n}  {live.sum()} lane(s) live  "
+            f"mean loss {first[live].mean():.4f} -> {last[live].mean():.4f}",
+            flush=True,
+        )
+
+
 def train_policy(
-    state0=[0, 1, 1.05],
-    params=None,
+    state0=(0, 1, 1.05),
     horizon=1.0,
-    effort_horizon=None,
+    total_horizon=10.0,
     iters=600,
     lr=0.1,
     effort_weight=DEFAULT_EFFORT_WEIGHT,
     penalize_effort=True,
     integrator=rk4_step,
-    history=None,
-    grad_norms=None,
-    param_history=None,
+    record_params=False,
     verbose=True,
     device=None,
     dtype=None,
     use_graph=True,
 ):
-    """One policy, as a batch of one.
-
-    `history`, if given, collects the loss triples; `grad_norms` the matching
-    gradient-norm triples; `param_history` the (w₁, w₂, w₃, b) each iteration
-    took its gradient at.
-    """
-    w, b, recorded, recorded_norms, *recorded_params = train_policy_batched(
+    """One receding-horizon run, as a batch of one: its RecedingRun, batch axis dropped."""
+    return train_receding_horizon(
         state0=state0,
         batch=1,
-        horizon=horizon,
-        effort_horizon=effort_horizon,
+        window=horizon,
+        total_horizon=total_horizon,
         iters=iters,
         learning_rate=lr,
         effort_weight=effort_weight,
@@ -473,35 +659,11 @@ def train_policy(
         device=device,
         dtype=dtype,
         use_graph=use_graph,
-        record_params=param_history is not None,
-    )
-
-    if history is not None:
-        history.extend(tuple(row) for row in recorded[:, 0, :])
-
-    if grad_norms is not None:
-        grad_norms.extend(tuple(row) for row in recorded_norms[:, 0, :])
-
-    if param_history is not None:
-        param_history.extend(tuple(row) for row in recorded_params[0][:, 0, :])
-
-    if verbose:
-        # read back off the recorded history rather than printing inside the
-        # loop, which on the graphed path would sync the device every iteration
-        for i in range(0, iters, 20):
-            task, penalty, total = recorded[i, 0]
-            print(
-                f"iter {i:4d}  loss {total:.4f}   task {task:.4f}   pen {penalty:.4f}"
-            )
-
-        print(f"w {w[0].cpu().numpy().round(3)}   b {b[0].item():+.3f}")
-
-    # the rest of the project -- figures.py above all -- works in float64 on
-    # the cpu, so the single-run door hands back what it always did whatever
-    # device and precision the batch actually trained in
-    return w[0].cpu().to(torch.float64), b[0].cpu().to(torch.float64)
+        record_params=record_params,
+        verbose=verbose,
+    ).lane(0)
 
 
 if __name__ == "__main__":
-    w, b = train_policy(lr=0.02)
-    print("learned feedback law: w =", w.cpu().numpy(), ". (x,y,z) +", b.item())
+    run = train_policy(lr=0.02)
+    print(f"success over the stitched trajectory: {success_fraction(run.traj):.4f}")

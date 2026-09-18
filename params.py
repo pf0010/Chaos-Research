@@ -51,9 +51,22 @@ def parse_bool(text):
         raise ValueError(f"expected a boolean, got {text!r}") from None
 
 
+def _optional(parse):
+    """Let None -- written to the csv as an empty cell -- mean "not set"."""
+
+    def parse_or_none(text):
+        if text is None or str(text).strip() in ("", "None"):
+            return None
+
+        return parse(text)
+
+    return parse_or_none
+
+
+@_optional
 def _parse_vector(text):
     if isinstance(text, (list, tuple)):
-        return tuple(text)
+        return tuple(float(c) for c in text)
 
     return tuple(float(part) for part in str(text).split("|"))
 
@@ -86,15 +99,31 @@ PARAMS = (
         "ic",
         "-ic",
         "initial condition",
-        (0, 1, 1.05),
+        # None is a random start on the attractor, drawn from `seed`; a run
+        # writes the start it drew back here, so a finished run always says
+        # where it began
+        None,
         _parse_vector,
         lambda v: "-".join(decimal_tag(c) for c in v),
-        show=lambda v: f"({','.join(str(c) for c in v)})",
+        show=lambda v: f"({','.join(f'{c:.4g}' for c in v)})",
         nargs=3,
         # an ensemble of starts costs one run, not one run each: training.py
         # already expands state0 to (batch, 3), which is a no-op when the
         # caller hands it one start per lane, and the evaluation rollout
         # broadcasts the same way
+        batchable=True,
+    ),
+    Param(
+        "seed",
+        "seed",
+        "-seed",
+        "random-start seed",
+        # None draws one from entropy; the run records the one it drew
+        None,
+        _optional(lambda v: int(float(v))),
+        lambda v: f"{int(v):d}",
+        # a start per lane, like initial_condition, so an ensemble of random
+        # starts is one batched run
         batchable=True,
     ),
     Param(
@@ -111,7 +140,7 @@ PARAMS = (
         "train_horizon",
         "th",
         "-th",
-        "training window (Lyapunov times)",
+        "RHC window (Lyapunov times)",
         1.0,
         float,
         _decimal(3),
@@ -125,7 +154,7 @@ PARAMS = (
         "plot_horizon",
         "ph",
         "-ph",
-        "plotting window (Lyapunov times)",
+        "projected horizon (Lyapunov times)",
         100.0,
         float,
         _decimal(1),
@@ -229,6 +258,9 @@ def stem(values, keys):
     if missing:
         raise KeyError(f"no value for {', '.join(missing)}")
 
+    # an unset value names nothing: a run from a given start has no seed
+    keys = [k for k in keys if values[k] is not None]
+
     ordered = sorted(keys, key=lambda name: BY_NAME[name].key)
 
     return "_".join(token(name, values[name]) for name in ordered) or "run"
@@ -238,18 +270,59 @@ def shown(values, names=None):
     """{name: caption text} in registry order, for settings_caption."""
     names = names if names is not None else [p.name for p in PARAMS]
 
-    return {name: BY_NAME[name].show(values[name]) for name in names if name in values}
+    return {
+        name: BY_NAME[name].show(values[name])
+        for name in names
+        if values.get(name) is not None
+    }
 
 
 def csv_value(name, value):
     param = BY_NAME[name]
 
+    if value is None:
+        return ""
     if param.nargs > 1:
         return "|".join(str(c) for c in value)
     if param.is_flag:
         return int(bool(value))
 
     return value
+
+
+def resolve_start(values):
+    """Where a run begins: (start, seed), the seed None for a given start.
+
+    A given initial_condition wins as it is. Otherwise the start is a random
+    point on the attractor drawn from `seed`, and a missing seed is drawn from
+    entropy first, so the one returned always reproduces the start.
+    """
+    given = values.get("initial_condition")
+    seed = values.get("seed")
+
+    if given is not None and seed is not None:
+        raise SystemExit(
+            "initial_condition and seed both set a start; give one or the other"
+        )
+
+    if given is not None:
+        return tuple(float(c) for c in given), None
+
+    # imported here so params.py stays free of torch
+    import numpy as np
+
+    from lorenz import random_attractor_state
+
+    seed = draw_seed() if seed is None else seed
+
+    return random_attractor_state(np.random.default_rng(seed)), seed
+
+
+def draw_seed():
+    """A fresh seed, small enough to read off a caption and type back in."""
+    import numpy as np
+
+    return int(np.random.SeedSequence().entropy % 2**31)
 
 
 def frange(start, stop, step):

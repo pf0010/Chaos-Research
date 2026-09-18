@@ -81,6 +81,21 @@ def rollout_numpy(state0, steps=DEFAULT_STEPS, u=0.0, integrator=rk4_step):
     return traj, derivs
 
 
+def random_attractor_state(rng, burn_in=10.0):
+    """A random point on the uncontrolled attractor.
+
+    Drawn from a box around the attractor and then integrated forward with no
+    control for `burn_in` Lyapunov times, so the transient has died out and the
+    start is somewhere the attractor actually visits rather than an arbitrary
+    corner of the box.
+    """
+    state0 = rng.uniform((-20.0, -20.0, 0.0), (20.0, 20.0, 45.0))
+    steps = round(burn_in / (LYAPUNOV_EXP * DT))
+    traj, _ = rollout_numpy(state0, steps=steps)
+
+    return tuple(float(c) for c in traj[-1])
+
+
 def rollout_torch(state0, control, steps=DEFAULT_STEPS, integrator=rk4_step):
     """Time-first: (steps+1, 3), or (steps+1, B, 3) if `state0` is a batch.
 

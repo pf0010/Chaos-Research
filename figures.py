@@ -393,6 +393,7 @@ def plot_loss_curve(
     save=False,
     out_dir=None,
     name_keys=None,
+    seed=None,
 ):
     task, penalty, total = np.asarray(history).T
     iterations = np.arange(len(total))
@@ -427,6 +428,7 @@ def plot_loss_curve(
         save=save,
         out_dir=out_dir,
         name_keys=name_keys,
+        seed=seed,
     )
 
 
@@ -443,6 +445,7 @@ def plot_grad_norm_curve(
     save=False,
     out_dir=None,
     name_keys=None,
+    seed=None,
 ):
     task, penalty, total = np.asarray(grad_norm).T
     iterations = np.arange(len(total))
@@ -482,6 +485,7 @@ def plot_grad_norm_curve(
         save=save,
         out_dir=out_dir,
         name_keys=name_keys,
+        seed=seed,
     )
 
 
@@ -498,7 +502,9 @@ def plot_state_gradient_through_window(
     save=False,
     out_dir=None,
     name_keys=None,
+    seed=None,
     max_rows=150,
+    starts=None,
 ):
     """‖∂L/∂s_t‖ at every step of the training window, across training.
 
@@ -508,6 +514,12 @@ def plot_state_gradient_through_window(
     rollout -- the lanes are independent, so one backward pass hands every
     state its own lane's gradient. `max_rows` strides the iterations to keep
     the saved activations bounded.
+
+    Under receding-horizon training each window starts somewhere new, so
+    `starts` -- one per window, iters rows each -- says where each row's
+    rollout begins; without it every row begins at `state0`. A shortened
+    last window is replayed over the full window, which only this
+    diagnostic sees.
     """
     seen = np.asarray(param_history, dtype=float)
     stride = max(1, math.ceil(len(seen) / max_rows))
@@ -517,16 +529,16 @@ def plot_state_gradient_through_window(
     b = torch.as_tensor(seen[rows, 3])
     steps = round(train_horizon / (LYAPUNOV_EXP * DT))
 
-    # the same objective training differentiated: a frozen-moment penalty
-    # never reaches the states, a pathwise one (equal windows) does
-    pathwise = penalize_effort and steps == round(plot_horizon / (LYAPUNOV_EXP * DT))
+    # the same objective training differentiated: every window's penalty is
+    # pathwise over that window, so it reaches the states like the task does
+    pathwise = penalize_effort
 
-    state = (
-        torch.as_tensor(np.asarray(state0, dtype=float))
-        .expand(len(rows), 3)
-        .clone()
-        .requires_grad_()
+    row_starts = (
+        np.asarray(starts, dtype=float)[rows // iters]
+        if starts is not None
+        else np.broadcast_to(np.asarray(state0, dtype=float), (len(rows), 3))
     )
+    state = torch.as_tensor(row_starts).clone().requires_grad_()
     states = [state]
 
     for _ in range(steps):
@@ -612,6 +624,7 @@ def plot_state_gradient_through_window(
         save=save,
         out_dir=out_dir,
         name_keys=name_keys,
+        seed=seed,
     )
 
 
@@ -629,10 +642,12 @@ def finish_training_curve(
     save,
     out_dir,
     name_keys,
+    seed=None,
 ):
     """Caption a per-iteration figure, then save it under `subdir` or show it."""
     values = run_values(
         initial_condition=tuple(state0),
+        seed=seed,
         learning_rate=lr,
         train_horizon=train_horizon,
         plot_horizon=plot_horizon,
@@ -661,9 +676,12 @@ def finish_training_curve(
 # the success figure's axes are fixed: a sweep is only ever read as success
 # against the training window, so the two of them are not the caller's choice
 X_KEY = "train_horizon"
-# ...and this one is an ensemble axis rather than a hyperparameter. Runs that
-# differ only in where they started are averaged into one line, not split apart
-ENSEMBLE_KEY = "initial_condition"
+# ...and these are ensemble axes rather than hyperparameters. Runs that differ
+# only in where they started -- a start given outright or one drawn from a
+# seed -- are averaged into one line, not split apart. A seeded run records
+# the start it drew, so its initial_condition varies with the seed and has to
+# be left out of the organizing too
+ENSEMBLE_KEYS = ("initial_condition", "seed")
 # four columns by six rows is about as much as a page holds and stays legible
 MAX_PANELS = 24
 
@@ -745,10 +763,10 @@ def plot_success(path, save=False):
     and still comparable to its neighbours. A grid too big for one page splits
     over its outermost parameters, a file per value.
 
-    initial_condition is the one parameter that does not organize anything.
-    Runs that differ only in where they started are the same experiment
-    repeated, so they collapse into one line: the mean, over a band spanning
-    the ensemble.
+    initial_condition and seed are the parameters that do not organize
+    anything. Runs that differ only in where they started are the same
+    experiment repeated, so they collapse into one line: the median, over
+    bands spanning the ensemble.
     """
     rows, columns, varying = read_sweep_csv(path)
 
@@ -758,7 +776,9 @@ def plot_success(path, save=False):
             f"the training window, so there is nothing to put on its x axis"
         )
 
-    organizing = [name for name in varying if name not in (X_KEY, ENSEMBLE_KEY)]
+    organizing = [
+        name for name in varying if name != X_KEY and name not in ENSEMBLE_KEYS
+    ]
 
     def numeric(name, row):
         return float(BY_NAME[name].parse(row[name]))
@@ -772,7 +792,11 @@ def plot_success(path, save=False):
     values_of = {
         name: sorted({numeric(name, row) for row in rows}) for name in organizing
     }
-    ics = {BY_NAME[ENSEMBLE_KEY].parse(row[ENSEMBLE_KEY]) for row in rows}
+    # a start is named by whichever of the two the csv carries
+    ics = {
+        tuple(BY_NAME[name].parse(row.get(name, "")) for name in ENSEMBLE_KEYS)
+        for row in rows
+    }
 
     # (the organizing parameters, x) -> every run there, which is one run per
     # initial condition. Anything the csv does not distinguish lands in the
@@ -818,10 +842,12 @@ def plot_success(path, save=False):
     # everything the grid held fixed, read back through the registry so a
     # boolean column reads 'on' rather than '1'
     settings = rows[0]
+    fixed = {name: BY_NAME[name].parse(settings[name]) for name in columns}
+    # an empty cell is a value the run never had -- a given start's seed
     caption = {
-        name: BY_NAME[name].show(BY_NAME[name].parse(settings[name]))
-        for name in columns
-        if name not in varying
+        name: BY_NAME[name].show(value)
+        for name, value in fixed.items()
+        if name not in varying and value is not None
     }
     caption["dt"] = DT
     caption["runs"] = len(rows)
@@ -831,7 +857,7 @@ def plot_success(path, save=False):
     spread = len(ics) > 1
 
     if spread:
-        caption["ensemble"] = f"{len(ics)} initial conditions"
+        caption["ensemble"] = f"{len(ics)} starts"
 
     x_param = BY_NAME[X_KEY]
     out_dir = os.path.dirname(path) or "."
@@ -1030,6 +1056,7 @@ def plot_run_summary(
     u=None,
     out_dir=None,
     name_keys=None,
+    seed=None,
 ):
     # a caller that batched the rollout already holds the trajectory, and
     # re-integrating it one lambda at a time would undo the point of batching
@@ -1045,6 +1072,7 @@ def plot_run_summary(
 
     values = run_values(
         initial_condition=tuple(state0),
+        seed=seed,
         learning_rate=lr,
         train_horizon=train_horizon,
         plot_horizon=plot_horizon,

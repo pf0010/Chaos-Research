@@ -1,4 +1,9 @@
-"""Sweep the controller over a grid of any run parameters.
+"""Sweep receding-horizon control over a grid of any run parameters.
+
+Every grid point is a receding-horizon run (training.train_receding_horizon):
+the projected horizon is cut into windows of the training window's length,
+each window trains its own law from where the last one left the system, and
+the stitched trajectory is what is scored and drawn.
 
 The grid is trained in batches, not one point at a time: λ and the learning
 rate ride along a leading batch axis, so a whole row of the grid costs one set
@@ -12,7 +17,8 @@ same number either way. See kernels.py.
     python sweep.py                             # the default lambda x window grid
     python sweep.py -sw lr=0.01:0.1:0.01        # sweep the learning rate instead
     python sweep.py -sw lam=0.05:0.15:0.01 -sw th=1:2:0.25 -sw rk4=0,1
-    python sweep.py -sw "ic=0:1:0.25|1|1.05"    # an ensemble of starts
+    python sweep.py -sw seed=0:31:1             # an ensemble of random starts
+    python sweep.py -sw "ic=0:1:0.25|1|1.05"    # or of given ones
     python sweep.py -j 4                        # cap at 4 figure-drawing workers
     python sweep.py -loss                       # also save a loss curve per point
     python sweep.py -gn                         # and/or a gradient-norm curve
@@ -25,10 +31,13 @@ An axis is NAME=start:stop:step (inclusive of stop) or NAME=v1,v2,v3, where
 NAME is any sweepable parameter in params.py, by canonical name or short key.
 Anything not swept keeps its default unless the matching flag below sets it.
 
-initial_condition writes its three components with |, and any of them may be a
-range: `ic=0|1|1.05,2|0|0.5` names two starts and `ic=0:1:0.25|1|1.05` draws a
-line of five along x. The starts ride the batch axis, so an ensemble costs one
-run rather than one run each, and the success figure averages over them.
+Every point starts at a random point on the attractor unless initial_condition
+is set. seed picks which random point; left alone, one seed is drawn and shared
+by the whole grid, so its points differ only in what was swept. initial_condition
+writes its three components with |, and any of them may be a range:
+`ic=0|1|1.05,2|0|0.5` names two starts and `ic=0:1:0.25|1|1.05` draws a line of
+five along x. Either way the starts ride the batch axis, so an ensemble costs
+one run rather than one run each, and the success figure averages over them.
 
 Each sweep claims the next number from plots/.sweep_counter and writes
 everything it produces into that one directory:
@@ -44,9 +53,9 @@ everything it produces into that one directory:
 The success figure always plots the success metric against the training window;
 every other parameter the grid varied gets a panel per combination, and a grid
 with more combinations than one page holds becomes a success_v_th/ directory
-instead, a file per value of its outermost parameters. initial_condition is the
-exception: runs differing only in where they started are one line, the mean
-over a band spanning the ensemble.
+instead, a file per value of its outermost parameters. initial_condition and
+seed are the exception: runs differing only in where they started are one
+line, the median over bands spanning the ensemble.
 
 Filenames carry only the axes the sweep varied — `lam0p100_th1p000.png` — so a
 constant never repeats across every name in the directory; the manifest and the
@@ -72,7 +81,9 @@ from params import (
     SWEEPABLE,
     csv_value,
     defaults,
+    draw_seed,
     parse_axis,
+    resolve_start,
     stem,
 )
 
@@ -166,6 +177,7 @@ def build_base(args, axes):
         name: value
         for name, value in (
             ("initial_condition", args.initial_condition),
+            ("seed", args.seed),
             ("learning_rate", args.learning_rate),
             ("plot_horizon", args.plot_horizon),
             ("iters", args.iters),
@@ -190,6 +202,16 @@ def build_base(args, axes):
     base = defaults()
     base.update(overrides)
 
+    named = {"initial_condition", "seed"} & (set(axes) | set(overrides))
+
+    if len(named) == 2:
+        raise SystemExit("initial_condition and seed both set the start; give one")
+
+    # random starts with no seed asked for: draw one for the whole grid, so the
+    # points share a start and differ only in what was swept
+    if not named:
+        base["seed"] = draw_seed()
+
     return base
 
 
@@ -204,37 +226,36 @@ def group_grid(grid):
 
     for values in grid:
         key = tuple(csv_value(name, values[name]) for name in SHAPING)
-        # a point whose effort window happens to coincide with its training
-        # window is scored by the pathwise penalty rather than the frozen
-        # moments -- a different objective, so it gets its own group
-        key += (values["plot_horizon"] == values["train_horizon"],)
         groups.setdefault(key, []).append(values)
 
     return list(groups.values())
 
 
 def train_group(group, device, dtype, use_graph):
-    """Train one batch and evaluate it, returning (w, b, history, grad_norm, traj, u, success).
+    """Train one batch of receding-horizon runs: its RecedingRun and success per lane.
 
-    The evaluation rollout is batched too, and it is the one the figures and
-    the success metric are read off, so every point in the group is measured
-    on exactly the trajectory that is drawn for it.
+    Each lane's start is resolved here -- given, or drawn from its seed -- and
+    written back into its values, so the csv and the captions record where a
+    random run actually began. Success is read off the stitched trajectory, the
+    same one that is drawn for the point.
     """
     # imported here so --dry-run and -sc don't pay for torch and matplotlib
-    from lorenz import DT, LYAPUNOV_EXP, euler_step, rk4_step, rollout_numpy_batched
-    from training import success_fraction, train_policy_batched
+    from lorenz import euler_step, rk4_step
+    from training import success_fraction, train_receding_horizon
 
     settings = group[0]
     integrator = rk4_step if settings["rk4"] else euler_step
-    # one start per lane, so an ensemble over initial conditions rides the
-    # batch axis like lambda does rather than splitting the grid
-    starts = [values["initial_condition"] for values in group]
 
-    w, b, history, grad_norm = train_policy_batched(
-        state0=starts,
+    # one start per lane, so an ensemble of starts rides the batch axis like
+    # lambda does rather than splitting the grid
+    for values in group:
+        values["initial_condition"], values["seed"] = resolve_start(values)
+
+    run = train_receding_horizon(
+        state0=[values["initial_condition"] for values in group],
         batch=len(group),
-        horizon=[values["train_horizon"] for values in group],
-        effort_horizon=settings["plot_horizon"],
+        window=[values["train_horizon"] for values in group],
+        total_horizon=settings["plot_horizon"],
         iters=settings["iters"],
         learning_rate=[values["learning_rate"] for values in group],
         effort_weight=[values["effort_weight"] for values in group],
@@ -243,17 +264,10 @@ def train_group(group, device, dtype, use_graph):
         device=device,
         dtype=dtype,
         use_graph=use_graph,
+        verbose=True,
     )
 
-    w = w.cpu().double().numpy()
-    b = b.cpu().double().numpy()
-
-    steps = round(settings["plot_horizon"] / (LYAPUNOV_EXP * DT))
-    traj, u = rollout_numpy_batched(
-        starts, w, b, steps=steps, integrator=integrator
-    )
-
-    return w, b, history, grad_norm, traj, u, success_fraction(traj)
+    return run, success_fraction(run.traj)
 
 
 def draw_point(job):
@@ -282,6 +296,7 @@ def draw_point(job):
     params = (torch.as_tensor(w), torch.as_tensor(b))
     shared = dict(
         state0=values["initial_condition"],
+        seed=values["seed"],
         lr=values["learning_rate"],
         train_horizon=values["train_horizon"],
         plot_horizon=values["plot_horizon"],
@@ -424,6 +439,13 @@ if __name__ == "__main__":
         type=float,
         default=None,
         metavar=("X", "Y", "Z"),
+    )
+    parser.add_argument(
+        "-seed",
+        "--seed",
+        type=int,
+        default=None,
+        help="seed for the random start (default: one drawn for the whole grid)",
     )
     parser.add_argument("-lr", "--learning_rate", type=float, default=None)
     parser.add_argument("-ph", "--plot_horizon", type=float, default=None)
@@ -574,7 +596,7 @@ if __name__ == "__main__":
 
     for n, group in enumerate(groups, start=1):
         at = time.monotonic()
-        w, b, history, grad_norm, traj, u, success = train_group(group, device, dtype, use_graph)
+        run, success = train_group(group, device, dtype, use_graph)
         elapsed = time.monotonic() - at
 
         held = "  ".join(
@@ -588,16 +610,20 @@ if __name__ == "__main__":
         )
 
         for i, values in enumerate(group):
+            lane = run.lane(i)
             rows.append((values, float(success[i])))
             jobs.append(
                 (
                     values,
-                    w[i],
-                    b[i],
-                    history[:, i, :],
-                    grad_norm[:, i, :],
-                    traj[:, i, :],
-                    u[:, i],
+                    # the summary's params are only a fallback for a figure
+                    # that has no trajectory; this one always has the stitched
+                    # one, so the last window's law stands in
+                    lane.w[-1],
+                    lane.b[-1],
+                    lane.history,
+                    lane.grad_norm,
+                    lane.traj,
+                    lane.u,
                     sweep_dir,
                     name_keys,
                     args.loss_curve,

@@ -17,13 +17,24 @@ import numpy as np
 import torch
 
 from kernels import cuda_available, moment_stats_cuda, moment_stats_numpy
-from lorenz import euler_step, lorenz_rhs, rk4_step, rollout_numpy, rollout_numpy_batched
+from lorenz import (
+    DT,
+    LYAPUNOV_EXP,
+    euler_step,
+    lorenz_rhs,
+    random_attractor_state,
+    rk4_step,
+    rollout_numpy,
+    rollout_numpy_batched,
+)
+from params import resolve_start
 from training import (
     BatchedAdam,
     effort_moments,
     init_policy_params,
     linear_policy,
     train_policy_batched,
+    train_receding_horizon,
 )
 
 CUDA = cuda_available()
@@ -381,6 +392,143 @@ def test_chaos_dominates_precision():
 
         assert precision < chaos, f"fp32 {precision:.2e} vs 1e-12 nudges {chaos:.2e}"
         print(f"  fp32 costs {precision:.1%}; a 1e-12 nudge costs {chaos:.1%}")
+
+
+RECEDING = dict(
+    iters=40,
+    learning_rate=0.05,
+    effort_weight=0.07,
+    penalize_effort=True,
+    device="cpu",
+    dtype=torch.float64,
+    use_graph=False,
+)
+
+
+def test_one_window_is_a_plain_run():
+    """With the window as long as the horizon, RHC is exactly one ordinary run."""
+    start = (0.0, 1.0, 1.05)
+    w0, b0 = (p.detach() for p in init_policy_params(1))
+
+    run = train_receding_horizon(
+        state0=start, window=1.0, total_horizon=1.0, init=(w0, b0), **RECEDING
+    )
+    w, b, history, _ = train_policy_batched(
+        state0=start, horizon=1.0, effort_horizon=None, init=(w0, b0), **RECEDING
+    )
+
+    assert run.windows.tolist() == [1]
+    assert np.array_equal(run.w[0], w.numpy())
+    assert np.array_equal(run.b[0], b.numpy())
+    assert np.array_equal(run.history, history)
+
+    steps = round(1.0 / (LYAPUNOV_EXP * DT))
+    traj, u = rollout_numpy_batched([start], w.numpy(), b.numpy(), steps=steps)
+
+    assert np.array_equal(run.traj, traj)
+    assert np.array_equal(run.u, u)
+
+
+def test_windows_hand_off_state_and_law():
+    """Window 2 must start where window 1's trained law left the system, from that law."""
+    start = (0.0, 1.0, 1.05)
+    w0, b0 = (p.detach() for p in init_policy_params(1))
+    seg = round(1.0 / (LYAPUNOV_EXP * DT))
+
+    run = train_receding_horizon(
+        state0=start, window=1.0, total_horizon=2.0, init=(w0, b0), **RECEDING
+    )
+
+    assert run.windows.tolist() == [2]
+    assert np.array_equal(run.starts[1], run.traj[seg])
+
+    w, b, _, _ = train_policy_batched(
+        state0=run.traj[seg],
+        horizon=1.0,
+        effort_horizon=None,
+        init=(run.w[0], run.b[0]),
+        **RECEDING,
+    )
+
+    assert np.array_equal(run.w[1], w.numpy())
+    assert np.array_equal(run.b[1], b.numpy())
+
+    # the stitched trajectory is law 1 over window 1, then law 2 from there
+    first, _ = rollout_numpy_batched([start], run.w[0], run.b[0], steps=seg)
+    second, u2 = rollout_numpy_batched(run.traj[seg], run.w[1], run.b[1], steps=seg)
+
+    assert np.array_equal(run.traj[: seg + 1], first)
+    assert np.array_equal(run.traj[seg:], second)
+    assert np.array_equal(run.u[seg:], u2)
+
+
+def test_a_remainder_window_is_shorter():
+    """A horizon the window doesn't divide ends on a short window, not an overshoot."""
+    run = train_receding_horizon(window=1.0, total_horizon=2.5, **{**RECEDING, "iters": 2})
+
+    assert run.windows.tolist() == [3]
+    assert len(run.traj) == round(2.5 / (LYAPUNOV_EXP * DT)) + 1
+    assert np.isfinite(run.traj).all() and np.isfinite(run.u).all()
+
+
+def test_finished_lanes_stay_frozen():
+    """Lanes with different windows batched together must each equal their solo run.
+
+    The longer-window lane runs out of windows first and sits out the rest at a
+    learning rate of zero, so its law, its trajectory and its records all have
+    to come back as if it had trained alone.
+    """
+    windows = [1.0, 2.0]
+    w0, b0 = (p.detach() for p in init_policy_params(2))
+
+    run = train_receding_horizon(
+        batch=2, window=windows, total_horizon=2.0, init=(w0, b0), **RECEDING
+    )
+
+    assert run.windows.tolist() == [2, 1]
+
+    for i, window in enumerate(windows):
+        one = train_receding_horizon(
+            window=window,
+            total_horizon=2.0,
+            init=(w0[i : i + 1], b0[i : i + 1]),
+            **RECEDING,
+        ).lane(0)
+        mine = run.lane(i)
+
+        assert np.abs(mine.w - one.w).max() < 1e-12, (window, mine.w, one.w)
+        assert np.abs(mine.traj - one.traj).max() < 1e-9, window
+        assert mine.history.shape == one.history.shape
+
+    # padding past a lane's last window repeats its last law exactly
+    assert np.array_equal(run.w[1, 1], run.w[0, 1])
+
+
+def test_random_start_is_reproducible():
+    """A seed names one start, on the attractor; a given start is taken as it is."""
+    a = random_attractor_state(np.random.default_rng(7))
+    b = random_attractor_state(np.random.default_rng(7))
+    c = random_attractor_state(np.random.default_rng(8))
+
+    assert a == b and a != c
+    x, y, z = a
+    assert abs(x) < 25 and abs(y) < 30 and 0 < z < 55, a
+
+    assert resolve_start({"initial_condition": None, "seed": 7}) == (a, 7)
+    assert resolve_start({"initial_condition": (0, 1, 1.05), "seed": None}) == (
+        (0.0, 1.0, 1.05),
+        None,
+    )
+
+    drawn, seed = resolve_start({"initial_condition": None, "seed": None})
+    assert resolve_start({"initial_condition": None, "seed": seed}) == (drawn, seed)
+
+    try:
+        resolve_start({"initial_condition": (0, 1, 1.05), "seed": 7})
+    except SystemExit:
+        return
+
+    raise AssertionError("a given start and a seed together should have been refused")
 
 
 if __name__ == "__main__":
