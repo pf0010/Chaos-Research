@@ -35,6 +35,7 @@ from training import (
     linear_policy,
     train_policy_batched,
     train_receding_horizon,
+    train_receding_prefixes,
 )
 
 CUDA = cuda_available()
@@ -466,8 +467,12 @@ def test_a_remainder_window_is_shorter():
     """A horizon the window doesn't divide ends on a short window, not an overshoot."""
     run = train_receding_horizon(window=1.0, total_horizon=2.5, **{**RECEDING, "iters": 2})
 
+    seg = round(1.0 / (LYAPUNOV_EXP * DT))
+
     assert run.windows.tolist() == [3]
-    assert len(run.traj) == round(2.5 / (LYAPUNOV_EXP * DT)) + 1
+    # two and a half windows, counted in windows rather than in raw steps
+    assert len(run.traj) == round(2.5 * seg) + 1
+    assert run.steps.tolist() == [round(2.5 * seg)]
     assert np.isfinite(run.traj).all() and np.isfinite(run.u).all()
 
 
@@ -529,6 +534,62 @@ def test_random_start_is_reproducible():
         return
 
     raise AssertionError("a given start and a seed together should have been refused")
+
+
+def _same_run(read, alone):
+    """Two single-lane RecedingRuns that must agree to the last bit."""
+    assert read.windows == alone.windows, (read.windows, alone.windows)
+
+    for field in ("w", "b", "traj", "u", "history", "grad_norm", "starts"):
+        mine, theirs = getattr(read, field), getattr(alone, field)
+
+        assert mine.shape == theirs.shape, (field, mine.shape, theirs.shape)
+        assert np.array_equal(mine, theirs), field
+
+
+def _alone(horizon, init, window=1.0):
+    return train_receding_horizon(
+        window=window, total_horizon=horizon, init=init, **RECEDING
+    ).lane(0)
+
+
+def test_prefix_equals_a_shorter_run():
+    """A horizon at a window boundary is read off the longer run exactly."""
+    init = tuple(p.detach() for p in init_policy_params(1))
+    runs = train_receding_prefixes([3.0, 2.0, 1.0], init=init, **RECEDING)[0]
+
+    _same_run(runs[0], _alone(3.0, init))
+    _same_run(runs[1], _alone(2.0, init))
+    _same_run(runs[2], _alone(1.0, init))
+
+    # whole windows nest with no rounding left over, so this is 10 windows
+    # read at 9, not 9 whole windows and a short tenth
+    seg = round(1.0 / (LYAPUNOV_EXP * DT))
+    assert runs[1].windows == 2 and len(runs[1].traj) == 2 * seg + 1
+
+
+def test_remainder_branch_equals_a_shorter_run():
+    """A horizon part-way through a window ends on its own shorter window."""
+    init = tuple(p.detach() for p in init_policy_params(1))
+    runs = train_receding_prefixes([3.0, 2.5], init=init, **RECEDING)[0]
+
+    _same_run(runs[1], _alone(2.5, init))
+    # and the branch leaves the long run it hangs off untouched
+    _same_run(runs[0], _alone(3.0, init))
+
+
+def test_prefix_shorter_than_a_window():
+    """A horizon inside the first window is one short window from the first law."""
+    init = tuple(p.detach() for p in init_policy_params(1))
+    runs = train_receding_prefixes([2.0, 0.5], init=init, **RECEDING)[0]
+
+    _same_run(runs[1], _alone(0.5, init))
+
+    # the law it starts from is the one the long run recorded, whether or not
+    # the caller handed one in
+    torch.manual_seed(3)
+    drawn = train_receding_prefixes([2.0, 0.5], **RECEDING)[0]
+    _same_run(drawn[1], _alone(0.5, (drawn[0].init_w[None], drawn[0].init_b[None])))
 
 
 if __name__ == "__main__":

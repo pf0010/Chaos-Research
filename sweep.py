@@ -5,6 +5,12 @@ the projected horizon is cut into windows of the training window's length,
 each window trains its own law from where the last one left the system, and
 the stitched trajectory is what is scored and drawn.
 
+A run to a shorter plot horizon is the first windows of a run to a longer one,
+so the plot horizon costs neither a group nor a lane: each lane is trained once,
+to the longest horizon swept, and every other horizon is read off it (a horizon
+that ends part-way through a window gets that last window trained on its own).
+`-sw ph=1:10:1` costs 10 windows, not 1+2+...+10.
+
 The grid is trained in batches, not one point at a time: λ and the learning
 rate ride along a leading batch axis, so a whole row of the grid costs one set
 of kernels rather than one set each. Everything that would change the shape of
@@ -17,6 +23,7 @@ same number either way. See kernels.py.
     python sweep.py                             # the default lambda x window grid
     python sweep.py -sw lr=0.01:0.1:0.01        # sweep the learning rate instead
     python sweep.py -sw lam=0.05:0.15:0.01 -sw th=1:2:0.25 -sw rk4=0,1
+    python sweep.py -sw ph=1:10:1 -sw th=1      # success vs. horizon, one run long
     python sweep.py -sw seed=0:31:1             # an ensemble of random starts
     python sweep.py -sw "ic=0:1:0.25|1|1.05"    # or of given ones
     python sweep.py -j 4                        # cap at 4 figure-drawing workers
@@ -45,12 +52,13 @@ everything it produces into that one directory:
     plots/sweep_007/
         manifest.json               # the axes, the constants, the git sha
         success.csv                 # one row per grid point, every parameter
-        success_v_th.png            # unless -np
+        success_v_th.png            # unless -np (success_v_ph.png if th is fixed)
         attractor/                  # one png per grid point
         loss_v_iteration/           # one png per grid point, with -loss
         grad_norm_v_iteration/      # one png per grid point, with -gn
 
-The success figure always plots the success metric against the training window;
+The success figure plots the success metric against the training window (or the
+plot horizon, when the window was held fixed);
 every other parameter the grid varied gets a panel per combination, and a grid
 with more combinations than one page holds becomes a success_v_th/ directory
 instead, a file per value of its outermost parameters. initial_condition and
@@ -76,6 +84,8 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 from params import (
+    BATCHABLE,
+    NESTED,
     PARAMS,
     SHAPING,
     SWEEPABLE,
@@ -231,34 +241,59 @@ def group_grid(grid):
     return list(groups.values())
 
 
-def train_group(group, device, dtype, use_graph):
-    """Train one batch of receding-horizon runs: its RecedingRun and success per lane.
+def lanes_of(group):
+    """A group's points by the training run they share.
 
-    Each lane's start is resolved here -- given, or drawn from its seed -- and
-    written back into its values, so the csv and the captions record where a
-    random run actually began. Success is read off the stitched trajectory, the
-    same one that is drawn for the point.
+    Points that differ only in a nested parameter -- the plot horizon -- are
+    prefixes of one run, so they share a lane; everything batchable tells
+    lanes apart.
+    """
+    lanes = {}
+
+    for values in group:
+        key = tuple(csv_value(name, values[name]) for name in BATCHABLE)
+        lanes.setdefault(key, []).append(values)
+
+    return list(lanes.values())
+
+
+def train_group(group, device, dtype, use_graph):
+    """Train one batch of receding-horizon runs: (values, run, success) per point.
+
+    Each lane is trained once, to the longest plot horizon in the group, and
+    every point on it is read off that run at its own horizon. Each lane's
+    start is resolved here -- given, or drawn from its seed -- and written back
+    into its points' values, so the csv and the captions record where a random
+    run actually began. Success is read off the point's stitched trajectory,
+    the same one that is drawn for it.
     """
     # imported here so --dry-run and -sc don't pay for torch and matplotlib
     from lorenz import euler_step, rk4_step
-    from training import success_fraction, train_receding_horizon
+    from training import success_fraction, train_receding_prefixes
 
     settings = group[0]
     integrator = rk4_step if settings["rk4"] else euler_step
+    lanes = lanes_of(group)
+    horizons = sorted({values["plot_horizon"] for values in group})
 
     # one start per lane, so an ensemble of starts rides the batch axis like
-    # lambda does rather than splitting the grid
-    for values in group:
-        values["initial_condition"], values["seed"] = resolve_start(values)
+    # lambda does rather than splitting the grid, and every horizon read off a
+    # lane shares its start
+    for points in lanes:
+        start, seed = resolve_start(points[0])
 
-    run = train_receding_horizon(
-        state0=[values["initial_condition"] for values in group],
-        batch=len(group),
-        window=[values["train_horizon"] for values in group],
-        total_horizon=settings["plot_horizon"],
+        for values in points:
+            values["initial_condition"], values["seed"] = start, seed
+
+    heads = [points[0] for points in lanes]
+    runs = train_receding_prefixes(
+        horizons,
+        state0=[values["initial_condition"] for values in heads],
+        batch=len(lanes),
+        window=[values["train_horizon"] for values in heads],
         iters=settings["iters"],
-        learning_rate=[values["learning_rate"] for values in group],
-        effort_weight=[values["effort_weight"] for values in group],
+        learning_rate=[values["learning_rate"] for values in heads],
+        effort_weight=[values["effort_weight"] for values in heads],
         penalize_effort=settings["penalize_effort"],
         integrator=integrator,
         device=device,
@@ -267,7 +302,12 @@ def train_group(group, device, dtype, use_graph):
         verbose=True,
     )
 
-    return run, success_fraction(run.traj)
+    return [
+        (values, run, float(success_fraction(run.traj)))
+        for points, lane_runs in zip(lanes, runs)
+        for values in points
+        for run in [lane_runs[horizons.index(values["plot_horizon"])]]
+    ]
 
 
 def draw_point(job):
@@ -521,13 +561,24 @@ if __name__ == "__main__":
         print(f"{name}: {values}")
 
     groups = group_grid(grid)
-    batched_over = [name for name in axis_names if name not in SHAPING]
+    batched_over = [
+        name for name in axis_names if name not in SHAPING and name not in NESTED
+    ]
+    nested_over = [name for name in axis_names if name in NESTED]
+    lane_count = sum(len(lanes_of(group)) for group in groups)
 
     print(
-        f"{len(grid)} runs in {len(groups)} batched group(s) of up to "
-        f"{max(len(g) for g in groups)}"
+        f"{len(grid)} runs on {lane_count} trained lane(s) in {len(groups)} "
+        f"batched group(s) of up to {max(len(lanes_of(g)) for g in groups)} lane(s)"
         + (f", batching over {', '.join(batched_over)}" if batched_over else "")
     )
+
+    for name in nested_over:
+        values = sorted(set(axes[name]))
+        print(
+            f"{name} shares runs: trained to {values[-1]}, "
+            f"read at {', '.join(str(v) for v in values)}"
+        )
     print(f"naming by: {', '.join(name_keys)}")
 
     # the axes decide the names, so a name can only collide if a formatter is
@@ -552,7 +603,10 @@ if __name__ == "__main__":
                 name: sorted({values[name] for values in group})
                 for name in batched_over
             }
-            print(f"group {n}: {len(group)} point(s)  {held}  batched {varies}")
+            print(
+                f"group {n}: {len(group)} point(s) on {len(lanes_of(group))} "
+                f"lane(s)  {held}  batched {varies}"
+            )
         sys.exit(0)
 
     # matplotlib must not reach for a GUI backend, and the drawing workers are
@@ -596,34 +650,35 @@ if __name__ == "__main__":
 
     for n, group in enumerate(groups, start=1):
         at = time.monotonic()
-        run, success = train_group(group, device, dtype, use_graph)
+        results = train_group(group, device, dtype, use_graph)
         elapsed = time.monotonic() - at
+        successes = [success for *_, success in results]
 
         held = "  ".join(
             f"{name}={group[0][name]}" for name in SHAPING if name in axis_names
         )
         print(
-            f"[group {n}/{len(groups)}] {len(group)} point(s)  "
+            f"[group {n}/{len(groups)}] {len(group)} point(s) on "
+            f"{len(lanes_of(group))} lane(s)  "
             + (f"{held}  " if held else "")
-            + f"{elapsed:.1f}s  success {success.min():.4f}-{success.max():.4f}",
+            + f"{elapsed:.1f}s  success {min(successes):.4f}-{max(successes):.4f}",
             flush=True,
         )
 
-        for i, values in enumerate(group):
-            lane = run.lane(i)
-            rows.append((values, float(success[i])))
+        for values, run, success in results:
+            rows.append((values, success))
             jobs.append(
                 (
                     values,
                     # the summary's params are only a fallback for a figure
                     # that has no trajectory; this one always has the stitched
                     # one, so the last window's law stands in
-                    lane.w[-1],
-                    lane.b[-1],
-                    lane.history,
-                    lane.grad_norm,
-                    lane.traj,
-                    lane.u,
+                    run.w[-1],
+                    run.b[-1],
+                    run.history,
+                    run.grad_norm,
+                    run.traj,
+                    run.u,
                     sweep_dir,
                     name_keys,
                     args.loss_curve,

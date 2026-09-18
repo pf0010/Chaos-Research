@@ -673,9 +673,10 @@ def finish_training_curve(
         plt.show()
 
 
-# the success figure's axes are fixed: a sweep is only ever read as success
-# against the training window, so the two of them are not the caller's choice
-X_KEY = "train_horizon"
+# the success figure's axes are fixed: y is success, and x is the training
+# window if the sweep varied it, otherwise the plot horizon. When both vary the
+# window keeps x and the horizon organizes panels like any other parameter
+X_KEYS = ("train_horizon", "plot_horizon")
 # ...and these are ensemble axes rather than hyperparameters. Runs that differ
 # only in where they started -- a start given outright or one drawn from a
 # seed -- are averaged into one line, not split apart. A seeded run records
@@ -757,7 +758,8 @@ def plot_success(path, save=False):
     """Success against the training window, one panel per hyperparameter combination.
 
     The axes never move: y is the success metric and x is the training window,
-    so two sweeps can be laid side by side and read the same way. Everything
+    so two sweeps can be laid side by side and read the same way. A sweep that
+    held the window fixed puts the plot horizon on x instead. Everything
     else the grid varied organizes the figure instead -- one panel per
     combination of them, sharing x and y limits so a panel is readable alone
     and still comparable to its neighbours. A grid too big for one page splits
@@ -770,14 +772,16 @@ def plot_success(path, save=False):
     """
     rows, columns, varying = read_sweep_csv(path)
 
-    if X_KEY not in varying:
+    x_key = next((name for name in X_KEYS if name in varying), None)
+
+    if x_key is None:
         raise SystemExit(
-            f"{X_KEY} does not vary in {path}; this figure is success against "
-            f"the training window, so there is nothing to put on its x axis"
+            f"neither {' nor '.join(X_KEYS)} varies in {path}; this figure is "
+            f"success against one of them, so there is nothing to put on its x axis"
         )
 
     organizing = [
-        name for name in varying if name != X_KEY and name not in ENSEMBLE_KEYS
+        name for name in varying if name != x_key and name not in ENSEMBLE_KEYS
     ]
 
     def numeric(name, row):
@@ -788,7 +792,7 @@ def plot_success(path, save=False):
 
         return f"{param.key}={param.show(param.parse(value))}"
 
-    xs_all = sorted({numeric(X_KEY, row) for row in rows})
+    xs_all = sorted({numeric(x_key, row) for row in rows})
     values_of = {
         name: sorted({numeric(name, row) for row in rows}) for name in organizing
     }
@@ -804,7 +808,7 @@ def plot_success(path, save=False):
     ensembles = {}
 
     for row in rows:
-        key = (tuple(numeric(name, row) for name in organizing), numeric(X_KEY, row))
+        key = (tuple(numeric(name, row) for name in organizing), numeric(x_key, row))
         ensembles.setdefault(key, []).append(float(row["success"]))
 
     # the outermost parameters page the figure until what is left fits, so the
@@ -859,7 +863,7 @@ def plot_success(path, save=False):
     if spread:
         caption["ensemble"] = f"{len(ics)} starts"
 
-    x_param = BY_NAME[X_KEY]
+    x_param = BY_NAME[x_key]
     out_dir = os.path.dirname(path) or "."
     outputs = []
 
@@ -1007,7 +1011,7 @@ def plot_success(path, save=False):
 
         if best:
             print(
-                f"{where}best success {best[0]:.4f} at {X_KEY}={best[1]}"
+                f"{where}best success {best[0]:.4f} at {x_key}={best[1]}"
                 + (
                     "  " + "  ".join(label(n, v) for n, v in best[2].items())
                     if best[2]

@@ -453,6 +453,11 @@ class RecedingRun(NamedTuple):
     training records end to end. A lane whose windows ran out before the
     batch's did (a longer window in a sweep) is padded past `windows[i]` with
     its last law frozen; `lane(i)` cuts that padding off.
+
+    `init_w`, `init_b` are the law the first window started from, `seg` each
+    lane's window in steps and `steps` how many steps each lane ran, which is
+    what reading a shorter run off this one needs (train_receding_prefixes).
+    Past its own `steps` a lane's `traj` and `u` are nan.
     """
 
     w: np.ndarray  # (N, B, 3)
@@ -463,24 +468,46 @@ class RecedingRun(NamedTuple):
     grad_norm: np.ndarray  # (N·iters, B, 3)
     starts: np.ndarray  # (N, B, 3), where each window began
     windows: np.ndarray  # (B,), how many windows each lane actually ran
-    params_seen: Optional[np.ndarray]  # (N·iters, B, 4), with record_params
+    params_seen: Optional[np.ndarray] = None  # (N·iters, B, 4), with record_params
+    init_w: Optional[np.ndarray] = None  # (B, 3)
+    init_b: Optional[np.ndarray] = None  # (B,)
+    seg: Optional[np.ndarray] = None  # (B,)
+    steps: Optional[np.ndarray] = None  # (B,)
 
     def lane(self, i):
         """Lane i alone, its padding dropped: every array loses the batch axis."""
         n = int(self.windows[i])
         rows = n * len(self.history) // len(self.w)
+        steps = int(self.steps[i])
 
         return RecedingRun(
             w=self.w[:n, i],
             b=self.b[:n, i],
-            traj=self.traj[:, i],
-            u=self.u[:, i],
+            traj=self.traj[: steps + 1, i],
+            u=self.u[: steps + 1, i],
             history=self.history[:rows, i],
             grad_norm=self.grad_norm[:rows, i],
             starts=self.starts[:n, i],
             windows=n,
             params_seen=None if self.params_seen is None else self.params_seen[:rows, i],
+            init_w=self.init_w[i],
+            init_b=self.init_b[i],
+            seg=int(self.seg[i]),
+            steps=steps,
         )
+
+
+def horizon_steps(horizon, window, seg):
+    """A horizon in steps, counted in windows: `horizon/window` windows of `seg`.
+
+    Not round(horizon / (LYAPUNOV_EXP·DT)). A window is 220.85 steps rounded
+    to 221, so counting the horizon in raw steps would make 10 Lyapunov times
+    9 whole windows and a short one, and the run to 10 would not extend the
+    run to 9. Counted this way a horizon that is a multiple of the window is
+    exactly that many windows, at the cost of the horizon running up to half
+    a step long per window.
+    """
+    return round(horizon / window * seg)
 
 
 def train_receding_horizon(
@@ -521,18 +548,22 @@ def train_receding_horizon(
     # in steps rather than Lyapunov times, so the windows tile the horizon
     # exactly instead of drifting by a rounding error each
     seg = np.array([round(h / unit) for h in windows_lt])
-    total = round(total_horizon / unit)
+    totals = np.array(
+        [horizon_steps(total_horizon, h, s) for h, s in zip(windows_lt, seg)]
+    )
 
-    if (seg < 1).any() or total < 1:
+    if (seg < 1).any() or (totals < 1).any():
         raise ValueError("the window and the total horizon must each be a step or more")
 
-    windows = -(-total // seg)
+    total = int(totals.max())
+    windows = -(-totals // seg)
     n = int(windows.max())
     lr = np.broadcast_to(np.asarray(learning_rate, dtype=float), (batch,))
 
     current = np.broadcast_to(np.asarray(state0, dtype=float), (batch, 3)).copy()
-    traj = np.empty((total + 1, batch, 3))
-    u = np.empty((total + 1, batch))
+    # nan past a lane's own horizon, which a different window can leave short
+    traj = np.full((total + 1, batch, 3), np.nan)
+    u = np.full((total + 1, batch), np.nan)
     traj[0] = current
 
     laws_w = np.empty((n, batch, 3))
@@ -540,11 +571,18 @@ def train_receding_horizon(
     starts = np.empty((n, batch, 3))
     histories, norms, seen = [], [], []
 
+    # drawn here rather than inside the first window, so the run can say what
+    # it started from -- the same draw train_policy_batched would have made
+    if init is None:
+        init = tuple(p.detach().numpy() for p in init_policy_params(batch))
+
+    init_w, init_b = (np.asarray(p, dtype=float).copy() for p in init)
+
     for k in range(n):
         offset = k * seg
         live = k < windows
         # a finished lane still needs some window to sit in; its own does
-        steps = np.where(live, np.minimum(seg, total - offset), seg)
+        steps = np.where(live, np.minimum(seg, totals - offset), seg)
         starts[k] = current
 
         w, b, history, grad_norm, *params_seen = train_policy_batched(
@@ -594,7 +632,8 @@ def train_receding_horizon(
     # the last state's control is never applied, but the figures plot it
     last = windows - 1
     lanes = np.arange(batch)
-    u[total] = (traj[total] * laws_w[last, lanes]).sum(-1) + laws_b[last, lanes]
+    ends = traj[totals, lanes]
+    u[totals, lanes] = (ends * laws_w[last, lanes]).sum(-1) + laws_b[last, lanes]
 
     return RecedingRun(
         w=laws_w,
@@ -606,6 +645,211 @@ def train_receding_horizon(
         starts=starts,
         windows=windows,
         params_seen=np.concatenate(seen) if record_params else None,
+        init_w=init_w,
+        init_b=init_b,
+        seg=seg,
+        steps=totals,
+    )
+
+
+def train_receding_prefixes(
+    horizons,
+    state0=(0, 1, 1.05),
+    batch=1,
+    window=1.0,
+    iters=600,
+    learning_rate=0.05,
+    effort_weight=DEFAULT_EFFORT_WEIGHT,
+    penalize_effort=True,
+    integrator=rk4_step,
+    device=None,
+    dtype=None,
+    use_graph=True,
+    init=None,
+    record_params=False,
+    verbose=False,
+):
+    """Receding-horizon runs to several total horizons, trained as one.
+
+    A run to a shorter horizon is the first windows of the run to a longer
+    one -- same start, same first law, same arithmetic -- so each lane is
+    trained once, to the longest of `horizons`, and every other horizon is read
+    off it. Where a horizon falls between window boundaries, its run ends on a
+    shorter window than the long run has there, trained over that shorter
+    window; those remainder windows are trained as branches off the long run,
+    all of them in one batched call.
+
+    Returns a list per lane of one single-lane RecedingRun per horizon, in the
+    order `horizons` gives them, each equal to what train_receding_horizon run
+    to that horizon alone would have given.
+    """
+    horizons = [float(h) for h in horizons]
+    longest = max(horizons)
+
+    run = train_receding_horizon(
+        state0=state0,
+        batch=batch,
+        window=window,
+        total_horizon=longest,
+        iters=iters,
+        learning_rate=learning_rate,
+        effort_weight=effort_weight,
+        penalize_effort=penalize_effort,
+        integrator=integrator,
+        device=device,
+        dtype=dtype,
+        use_graph=use_graph,
+        init=init,
+        record_params=record_params,
+        verbose=verbose,
+    )
+
+    windows_lt = np.broadcast_to(np.asarray(window, dtype=float), (batch,))
+    lrs = np.broadcast_to(np.asarray(learning_rate, dtype=float), (batch,))
+    lams = np.broadcast_to(np.asarray(effort_weight, dtype=float), (batch,))
+    lanes = [run.lane(i) for i in range(batch)]
+
+    # (lane, horizon index, whole windows, remainder steps) for every horizon
+    # that ends part-way through a window of the long run
+    branches = []
+    runs = [[None] * len(horizons) for _ in range(batch)]
+
+    for i, lane in enumerate(lanes):
+        for j, horizon in enumerate(horizons):
+            steps = horizon_steps(horizon, windows_lt[i], lane.seg)
+            whole, rest = divmod(steps, lane.seg)
+
+            if steps == lane.steps:
+                # the long run itself, remainder window and all
+                runs[i][j] = lane
+            elif rest == 0:
+                runs[i][j] = _cut(lane, whole, steps, iters)
+            else:
+                branches.append((i, j, whole, rest))
+
+    if branches:
+        _train_branches(
+            runs,
+            lanes,
+            branches,
+            lrs,
+            lams,
+            verbose,
+            iters=iters,
+            penalize_effort=penalize_effort,
+            integrator=integrator,
+            device=device,
+            dtype=dtype,
+            use_graph=use_graph,
+            record_params=record_params,
+        )
+
+    return runs
+
+
+def _cut(lane, whole, steps, iters):
+    """The first `whole` windows of a single-lane run, ending at step `steps`."""
+    rows = whole * iters
+    traj = lane.traj[: steps + 1]
+    u = lane.u[: steps + 1].copy()
+    # the long run's control here is the next window's law; a run that ends
+    # here plots its own last law's instead
+    # -- in the same arithmetic train_receding_horizon uses, to the last bit
+    u[steps] = (traj[steps] * lane.w[whole - 1]).sum(-1) + lane.b[whole - 1]
+
+    return lane._replace(
+        w=lane.w[:whole],
+        b=lane.b[:whole],
+        traj=traj,
+        u=u,
+        history=lane.history[:rows],
+        grad_norm=lane.grad_norm[:rows],
+        starts=lane.starts[:whole],
+        windows=whole,
+        params_seen=None if lane.params_seen is None else lane.params_seen[:rows],
+    )
+
+
+def _train_branches(runs, lanes, branches, lrs, lams, verbose, **common):
+    """Train every remainder window at once and fill in each one's run.
+
+    `common` is what train_policy_batched takes that every branch shares.
+    """
+    unit = LYAPUNOV_EXP * DT
+    heads = []
+    starts, laws_w, laws_b, rests = [], [], [], []
+
+    for i, _, whole, rest in branches:
+        lane = lanes[i]
+        # a horizon inside the first window has no prefix: its one window
+        # starts from the start, and from the law the long run started from
+        head = _cut(lane, whole, whole * lane.seg, common["iters"]) if whole else None
+        heads.append(head)
+        starts.append(lane.traj[whole * lane.seg])
+        laws_w.append(lane.w[whole - 1] if whole else lane.init_w)
+        laws_b.append(lane.b[whole - 1] if whole else lane.init_b)
+        rests.append(rest)
+
+    rests = np.array(rests)
+    count = len(branches)
+    picks = [i for i, *_ in branches]
+
+    w, b, history, grad_norm, *params_seen = train_policy_batched(
+        state0=np.array(starts),
+        batch=count,
+        horizon=rests * unit,
+        effort_horizon=None,
+        learning_rate=lrs[picks],
+        effort_weight=lams[picks],
+        init=(np.array(laws_w), np.array(laws_b)),
+        **common,
+    )
+
+    w = w.cpu().double().numpy()
+    b = b.cpu().double().numpy()
+    piece, controls = rollout_numpy_batched(
+        np.array(starts), w, b, steps=int(rests.max()), integrator=common["integrator"]
+    )
+
+    if verbose:
+        print(f"remainder windows: {count} branch(es) off the longest run", flush=True)
+
+    for k, (i, j, whole, rest) in enumerate(branches):
+        tail = lanes[i]._replace(
+            w=w[k : k + 1],
+            b=b[k : k + 1],
+            traj=piece[: rest + 1, k],
+            u=controls[: rest + 1, k],
+            history=history[:, k],
+            grad_norm=grad_norm[:, k],
+            starts=piece[:1, k],
+            windows=1,
+            params_seen=params_seen[0][:, k] if params_seen else None,
+        )
+        runs[i][j] = tail if heads[k] is None else _join(heads[k], tail)
+
+
+
+def _join(head, tail):
+    """One single-lane run followed by another that starts where it ends."""
+
+    def both(field):
+        first, second = getattr(head, field), getattr(tail, field)
+
+        return None if first is None else np.concatenate((first, second))
+
+    return head._replace(
+        w=both("w"),
+        b=both("b"),
+        # the tail's first state is the head's last; its first control is the
+        # tail's law's, the one acting from there, so it replaces the head's
+        traj=np.concatenate((head.traj[:-1], tail.traj)),
+        u=np.concatenate((head.u[:-1], tail.u)),
+        history=both("history"),
+        grad_norm=both("grad_norm"),
+        starts=both("starts"),
+        windows=head.windows + tail.windows,
+        params_seen=both("params_seen"),
     )
 
 

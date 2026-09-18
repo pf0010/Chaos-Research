@@ -91,6 +91,10 @@ class Param:
     # along as a per-element tensor. Anything that changes the step count or
     # the integrator splits the grid into separate runs instead.
     batchable: bool = False
+    # whether a smaller value is a prefix of the run at a larger one. Such a
+    # parameter costs neither a group nor a lane: the lane is trained once, to
+    # the largest value in its group, and every other value is read off it
+    nested: bool = False
 
 
 PARAMS = (
@@ -158,6 +162,9 @@ PARAMS = (
         100.0,
         float,
         _decimal(1),
+        # a receding-horizon run to 9 Lyapunov times is the first 9 windows of
+        # the run to 10, so a sweep over it trains the longest one only
+        nested=True,
     ),
     Param(
         "iters",
@@ -206,8 +213,11 @@ BY_NAME = {param.name: param for param in PARAMS}
 BY_KEY = {param.key: param for param in PARAMS}
 SWEEPABLE = [param.name for param in PARAMS if param.sweepable]
 BATCHABLE = [param.name for param in PARAMS if param.batchable]
+NESTED = [param.name for param in PARAMS if param.nested]
 # what a batched run has to hold fixed, and so what sweep.py groups the grid by
-SHAPING = [param.name for param in PARAMS if not param.batchable]
+SHAPING = [
+    param.name for param in PARAMS if not param.batchable and not param.nested
+]
 
 
 def resolve(name):
