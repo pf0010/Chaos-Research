@@ -119,8 +119,10 @@ def rollout_torch(state0, control, steps=DEFAULT_STEPS, integrator=rk4_step):
 
 
 def rollout_numpy_batched(state0, w, b, steps=DEFAULT_STEPS, integrator=rk4_step):
-    """Closed-loop rollout of B policies at once: traj (steps+1, B, 3), u (steps+1, B).
+    """B held-control rollouts at once: traj (steps+1, B, 3), u (steps+1, B).
 
+    Each lane's law is sampled once, at `state0`, and that u is held over every
+    step, as over a training window; `u` is that value repeated, one per state.
     Nothing here is differentiated -- this is the evaluation trajectory the
     figures and the success metric are read off -- so it stays in numpy, where
     a step on a (B, 3) array costs a fraction of the same step as torch ops.
@@ -128,20 +130,14 @@ def rollout_numpy_batched(state0, w, b, steps=DEFAULT_STEPS, integrator=rk4_step
     w = np.asarray(w, dtype=float)
     b = np.asarray(b, dtype=float)
     state = np.broadcast_to(np.asarray(state0, dtype=float), w.shape).copy()
-
-    def control(states):
-        return (states * w).sum(-1) + b
+    u = (state * w).sum(-1) + b
 
     traj = np.empty((steps + 1, *w.shape))
-    controls = np.empty((steps + 1, w.shape[0]))
-
     traj[0] = state
-    controls[0] = control(state)
 
     for t in range(steps):
-        state, _ = integrator(state, control)
+        state, _ = integrator(state, u)
 
         traj[t + 1] = state
-        controls[t + 1] = control(state)
 
-    return traj, controls
+    return traj, np.broadcast_to(u, (steps + 1, w.shape[0])).copy()

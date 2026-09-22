@@ -141,7 +141,9 @@ def wrap_caption(caption, width):
 
 
 def rollout_closed_loop(params, state0=(0, 1, 1.05), steps=300, integrator=rk4_step):
-    # the trajectory is only ever plotted, and taping a rollout this long costs
+    # per-step feedback, not the held control training uses: only reached when
+    # plot_run_summary is given no trajectory, which no caller does.
+    # The trajectory is only ever plotted, and taping a rollout this long costs
     # about as much again as integrating it
     with torch.no_grad():
         traj = rollout_torch(
@@ -260,8 +262,9 @@ def plot_state_and_control(
     ax_traj.legend(loc="upper right")
 
     ax_u.axhline(0, color="black", linestyle="--", linewidth=1)
-    ax_u.plot(times, u, color="crimson", linewidth=0.6)
-    ax_u.set_ylabel("control u = w·s + b")
+    # u[t] acts from t to t+1, held over each window
+    ax_u.plot(times, u, color="crimson", linewidth=0.6, drawstyle="steps-post")
+    ax_u.set_ylabel("control u (held per window)")
     ax_u.set_xlabel("Lyapunov times (t / τ)")
     ax_u.set_title("Controller action")
 
@@ -338,14 +341,11 @@ def plot_loss_gradient_vs_horizon(
     norms = []
     # one draw for every horizon, so the curve moves with the window alone
     params = init_policy_params()
+    # sampled at the start and held over the window, as in training
+    u = linear_policy(params, torch.as_tensor(state0, dtype=torch.float64))
     for horizon in horizons:
         steps = round(horizon / (LYAPUNOV_EXP * DT))
-        traj = rollout_torch(
-            state0,
-            lambda s: linear_policy(params, s),
-            steps=steps,
-            integrator=integrator,
-        )
+        traj = rollout_torch(state0, u, steps=steps, integrator=integrator)
         grads = torch.autograd.grad(task_loss(traj), params)
         norms.append(torch.cat([g.reshape(-1) for g in grads]).norm().item())
 
@@ -529,10 +529,6 @@ def plot_state_gradient_through_window(
     b = torch.as_tensor(seen[rows, 3])
     steps = round(train_horizon / (LYAPUNOV_EXP * DT))
 
-    # the same objective training differentiated: every window's penalty is
-    # pathwise over that window, so it reaches the states like the task does
-    pathwise = penalize_effort
-
     row_starts = (
         np.asarray(starts, dtype=float)[rows // iters]
         if starts is not None
@@ -540,17 +536,20 @@ def plot_state_gradient_through_window(
     )
     state = torch.as_tensor(row_starts).clone().requires_grad_()
     states = [state]
+    # the same objective training differentiated: each row's law sampled at
+    # its window's start and held over the window
+    u = linear_policy((w, b), state)
 
     for _ in range(steps):
-        state, _ = integrator(state, lambda s: linear_policy((w, b), s))
+        state, _ = integrator(state, u)
         state.retain_grad()
         states.append(state)
 
     traj = torch.stack(states)
     loss = task_loss(traj)
 
-    if pathwise:
-        loss = loss + effort_weight * effort_penalty(traj, (w, b))
+    if penalize_effort:
+        loss = loss + effort_weight * effort_penalty(u)
 
     loss.sum().backward()
 

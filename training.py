@@ -1,8 +1,11 @@
 """The learned controller: policy, objectives, and the training loop.
 
-The policy is a linear feedback law u = w·s + b, trained by differentiating
-straight through the integrator, so the training window is limited by how far
-the gradient survives the attractor's exponential stretching.
+The policy is a linear law u = w·s + b, sampled once at the start of each
+window -- where the previous window ended -- and held constant over the whole
+window. It is trained by differentiating straight through the integrator, so
+the training window is limited by how far the gradient survives the
+attractor's exponential stretching. With the start fixed while a window
+trains, the loss sees (w, b) only through that one held u.
 
 That limit is why control is receding-horizon (train_receding_horizon): the
 projected horizon is cut into short windows, each window trains its own law
@@ -103,14 +106,9 @@ def success_fraction(traj):
     return (x > 0).mean(0)
 
 
-def effort_penalty(traj, params, u_ref=U_REF, mask=None):
-    w, b = params
-
-    # the control at the final state is never applied, so drop it
-    u = (traj[:-1] * w).sum(-1) + b
-    cost = (u / u_ref).pow(2)
-
-    return cost.mean(0) if mask is None else masked_mean(cost, mask)
+def effort_penalty(u, u_ref=U_REF):
+    # u is held over the window, so its mean square over the window is its own
+    return (u / u_ref).pow(2)
 
 
 def effort_moments(state0, params, steps, integrator=rk4_step):
@@ -128,11 +126,10 @@ def effort_moments(state0, params, steps, integrator=rk4_step):
 
 
 def effort_from_moments(moments, params, u_ref=U_REF):
-    """effort_penalty on the moments: <u²> = wᵀMw + 2b mᵀw + b².
+    """<u²> of a per-step feedback law from the moments: wᵀMw + 2b mᵀw + b².
 
-    Same value and same gradient as effort_penalty over the states those
-    moments came from, since w and b are the only things it differentiates
-    through -- the states are frozen either way.
+    Training holds u over each window and no longer uses this; it prices a law
+    re-evaluated at every state, over a rollout whose states are frozen.
     """
     M, m = (
         moment
@@ -214,7 +211,6 @@ def train_policy_batched(
     state0=(0, 1, 1.05),
     batch=1,
     horizon=1.0,
-    effort_horizon=None,
     iters=600,
     learning_rate=0.05,
     effort_weight=DEFAULT_EFFORT_WEIGHT,
@@ -262,42 +258,14 @@ def train_policy_batched(
     steps = int(lane_steps.max())
     uniform = bool((lane_steps == lane_steps[0]).all())
 
-    # the penalty is meant to price the control we actually deploy, so it is
-    # measured over the evaluation horizon rather than the training window --
-    # a law that looks cheap over one Lyapunov time can cost several times
-    # more once the run continues past it. None keeps the two windows equal.
-    if effort_horizon is None:
-        # the penalty rides the training trajectory, so it is differentiated
-        # through the states like the task term is
-        effort_steps = None
-        pathwise = np.ones(batch, dtype=bool)
-    else:
-        effort_steps = round(effort_horizon / (LYAPUNOV_EXP * DT))
-        pathwise = lane_steps == effort_steps
-
-    # the two penalties are not the same objective -- one lets the gradient run
-    # back through the states, the other freezes them -- so a batch may not mix
-    # them. sweep.py keys its groups on this, so a grid never asks for it
-    if pathwise.any() and not pathwise.all():
-        raise ValueError(
-            "this batch mixes lanes whose effort window equals their training "
-            "window with lanes whose does not. Those differentiate the penalty "
-            "differently (pathwise states vs frozen moments) and cannot share "
-            "a run; split them, or set effort_horizon clear of every window"
-        )
-
-    use_moments = penalize_effort and not pathwise.all()
-
     if uniform:
-        task_mask = effort_mask = None
+        task_mask = None
     else:
         ticks = torch.arange(steps + 1, device=device).unsqueeze(-1)
         lanes = torch.as_tensor(lane_steps, device=device).unsqueeze(0)
 
-        # task_loss averages over states 0..steps inclusive, effort_penalty
-        # over the controls at 0..steps-1, so the two windows differ by one
+        # task_loss averages over states 0..steps inclusive
         task_mask = ticks <= lanes
-        effort_mask = ticks[:-1] < lanes
 
     lam = _as_batch(effort_weight, batch, device, dtype)
     lr = _as_batch(learning_rate, batch, device, dtype)
@@ -305,8 +273,12 @@ def train_policy_batched(
     if init is None:
         w, b = init_policy_params(batch, device=device, dtype=dtype)
     else:
+        # contiguous_format, not clone()'s default: a broadcast init (stride 0)
+        # would otherwise keep that layout, and its grad would not match it
         w, b = (
-            torch.as_tensor(p, device=device, dtype=dtype).clone().requires_grad_()
+            torch.as_tensor(p, device=device, dtype=dtype)
+            .clone(memory_format=torch.contiguous_format)
+            .requires_grad_()
             for p in init
         )
     state0 = (
@@ -324,25 +296,13 @@ def train_policy_batched(
     step_index = torch.zeros(1, dtype=torch.long, device=device)
 
     def iteration():
-        traj = rollout_torch(
-            state0,
-            lambda s: linear_policy((w, b), s),
-            steps=steps,
-            integrator=integrator,
-        )
+        # sampled once, at the window's start, and held over every step and
+        # every RK4 stage of it: a tensor rather than a callable, so
+        # eval_control hands the integrator the same u throughout
+        u = linear_policy((w, b), state0)
+        traj = rollout_torch(state0, u, steps=steps, integrator=integrator)
         task = task_loss(traj, mask=task_mask)
-
-        if use_moments:
-            # moments of a rollout we do not differentiate through: over this
-            # many Lyapunov times the pathwise gradient is pure amplified noise
-            # (run -lgh to see it blow up), so the gradient reaches w and b
-            # through the policy alone. Cheap, and well conditioned.
-            effort = effort_from_moments(
-                effort_moments(state0, (w, b), effort_steps, integrator), (w, b)
-            )
-        else:
-            # unpenalized runs only log the number, so keep the rollout short
-            effort = effort_penalty(traj, (w, b), mask=effort_mask)
+        effort = effort_penalty(u)
 
         penalty = lam * effort
         loss = task + penalty if penalize_effort else task
@@ -353,8 +313,8 @@ def train_policy_batched(
         # the policies are independent, so the sum hands each element exactly
         # the gradient it would have got from its own backward pass. The two
         # terms go back separately so each one's norm can be recorded; the
-        # pathwise penalty shares the rollout, so that graph has to survive
-        task.sum().backward(retain_graph=penalize_effort and not use_moments)
+        # penalty shares u with the rollout, so that graph has to survive
+        task.sum().backward(retain_graph=penalize_effort)
         task_norm = norm(w.grad, b.grad)
 
         if penalize_effort:
@@ -456,8 +416,10 @@ class RecedingRun(NamedTuple):
 
     The controller is the sequence of laws, one per window, so `w` and `b` carry
     a window axis in front of the batch axis. `traj` and `u` are the trajectory
-    stitched from those windows -- law k applied over window k -- and are what a
-    run is scored and drawn on. `history` and `grad_norm` are every window's
+    stitched from those windows -- law k sampled at window k's start and held
+    over it -- and are what a run is scored and drawn on. `u[t]` is the control
+    acting from t to t+1, so it is constant within a window and steps at each
+    window's first state. `history` and `grad_norm` are every window's
     training records end to end. A lane whose windows ran out before the
     batch's did (a longer window in a sweep) is padded past `windows[i]` with
     its last law frozen; `lane(i)` cuts that padding off.
@@ -539,8 +501,10 @@ def train_receding_horizon(
 
     `total_horizon` is split into back-to-back windows of `window` Lyapunov
     times, the last one shorter if the two don't divide. Window k trains its own
-    (w, b) over that window alone -- task and effort both, pathwise -- starting
-    from the state window k-1 ended in and from window k-1's law. Only the
+    (w, b) over that window alone -- task and effort both -- starting from the
+    state window k-1 ended in and from window k-1's law. The control over
+    window k is that law sampled once at that start, u_k = w·s_k + b, and held
+    for the whole window, so training moves (w, b) only through u_k. Only the
     first window starts from a random law, and Adam starts afresh every window.
     The trained law is then applied over its window to find where the next one
     starts: rolled out with the law as it finished, not as it stood at the last
@@ -597,7 +561,6 @@ def train_receding_horizon(
             state0=current,
             batch=batch,
             horizon=steps * unit,
-            effort_horizon=None,
             iters=iters,
             learning_rate=np.where(live, lr, 0.0),
             effort_weight=effort_weight,
@@ -637,11 +600,10 @@ def train_receding_horizon(
         if verbose:
             _log_window(k, n, starts[k], history, w, b, live)
 
-    # the last state's control is never applied, but the figures plot it
-    last = windows - 1
+    # the last state's control is never applied, but the figures plot it:
+    # the last window's held value, carried to the end
     lanes = np.arange(batch)
-    ends = traj[totals, lanes]
-    u[totals, lanes] = (ends * laws_w[last, lanes]).sum(-1) + laws_b[last, lanes]
+    u[totals, lanes] = u[totals - 1, lanes]
 
     return RecedingRun(
         w=laws_w,
@@ -760,10 +722,10 @@ def _cut(lane, whole, steps, iters):
     rows = whole * iters
     traj = lane.traj[: steps + 1]
     u = lane.u[: steps + 1].copy()
-    # the long run's control here is the next window's law; a run that ends
-    # here plots its own last law's instead
-    # -- in the same arithmetic train_receding_horizon uses, to the last bit
-    u[steps] = (traj[steps] * lane.w[whole - 1]).sum(-1) + lane.b[whole - 1]
+    # the long run's control here is the next window's held value; a run that
+    # ends here carries its own last window's instead, as
+    # train_receding_horizon does
+    u[steps] = u[steps - 1]
 
     return lane._replace(
         w=lane.w[:whole],
@@ -806,7 +768,6 @@ def _train_branches(runs, lanes, branches, lrs, lams, verbose, **common):
         state0=np.array(starts),
         batch=count,
         horizon=rests * unit,
-        effort_horizon=None,
         learning_rate=lrs[picks],
         effort_weight=lams[picks],
         init=(np.array(laws_w), np.array(laws_b)),

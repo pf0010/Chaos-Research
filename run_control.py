@@ -9,9 +9,10 @@
     python run_control.py -lgh 8               # loss-gradient vs. horizon
 
 The projected horizon -ph is cut into windows of -th Lyapunov times. Each
-window trains its own feedback law for -i iterations from where the previous
-window's law left the system, starting from that law; the trajectory stitched
-from those windows is what is scored and drawn.
+window trains its own law u = w·s + b for -i iterations from where the previous
+window's law left the system, starting from that law. The law is sampled once,
+at the window's start, and that u is held over the whole window; the trajectory
+stitched from those windows is what is scored and drawn.
 
 The start is -ic if given, otherwise a random point on the attractor drawn from
 -seed (itself drawn and printed when not given, so any run can be repeated).

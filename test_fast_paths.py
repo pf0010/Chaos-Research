@@ -261,10 +261,6 @@ def test_mixed_windows_match_their_own_runs():
     back to its own, so this is the check that the mask covers exactly the
     steps a standalone run would have taken -- one step out in either direction
     and the shorter lanes would drift.
-
-    effort_horizon is left None on purpose. With the long moment rollout in
-    play a last-bit difference is amplified into a visible one, which would
-    make this a measurement of the attractor rather than of the mask.
     """
     if not CUDA:
         print("  (skipped: no CUDA device)")
@@ -275,7 +271,6 @@ def test_mixed_windows_match_their_own_runs():
     common = dict(
         iters=25,
         penalize_effort=True,
-        effort_horizon=None,
         learning_rate=0.05,
         device="cuda",
         dtype=torch.float64,
@@ -315,15 +310,12 @@ def test_mixed_starts_match_their_own_runs():
     train, still converge and still plot -- it would just be answering a
     question nobody asked. So this checks the laws exactly, and checks that
     each lane's rollout actually began where it was told to.
-
-    effort_horizon is left None for the reason the mixed-window test gives.
     """
     starts = [(0.0, 1.0, 1.05), (0.5, 1.0, 1.05), (1.0, 1.0, 1.05), (-0.3, 0.2, 2.0)]
     common = dict(
         horizon=1.0,
         iters=25,
         penalize_effort=True,
-        effort_horizon=None,
         learning_rate=0.05,
         effort_weight=0.07,
         device="cpu",
@@ -360,23 +352,6 @@ def test_mixed_starts_match_their_own_runs():
     traj, _ = rollout_numpy_batched(starts, w.numpy(), b.numpy(), steps=4)
 
     assert np.array_equal(traj[0], np.asarray(starts, dtype=float)), traj[0]
-
-
-def test_a_batch_may_not_mix_the_two_penalties():
-    """Pathwise and frozen-moment penalties are different objectives."""
-    try:
-        train_policy_batched(
-            batch=2,
-            horizon=[1.0, 2.0],
-            effort_horizon=1.0,
-            penalize_effort=True,
-            iters=2,
-            device="cpu",
-        )
-    except ValueError:
-        return
-
-    raise AssertionError("a mixed batch should have been refused")
 
 
 def test_chaos_dominates_precision():
@@ -442,7 +417,7 @@ def test_one_window_is_a_plain_run():
         state0=start, window=1.0, total_horizon=1.0, init=(w0, b0), **RECEDING
     )
     w, b, history, _ = train_policy_batched(
-        state0=start, horizon=1.0, effort_horizon=None, init=(w0, b0), **RECEDING
+        state0=start, horizon=1.0, init=(w0, b0), **RECEDING
     )
 
     assert run.windows.tolist() == [1]
@@ -473,7 +448,6 @@ def test_windows_hand_off_state_and_law():
     w, b, _, _ = train_policy_batched(
         state0=run.traj[seg],
         horizon=1.0,
-        effort_horizon=None,
         init=(run.w[0], run.b[0]),
         **RECEDING,
     )
@@ -488,6 +462,21 @@ def test_windows_hand_off_state_and_law():
     assert np.array_equal(run.traj[: seg + 1], first)
     assert np.array_equal(run.traj[seg:], second)
     assert np.array_equal(run.u[seg:], u2)
+
+
+def test_control_is_held_over_each_window():
+    """u is sampled once at each window's start and held until the next one."""
+    seg = round(1.0 / (LYAPUNOV_EXP * DT))
+    run = train_receding_horizon(window=1.0, total_horizon=2.0, **RECEDING)
+
+    for k in range(2):
+        held = (run.starts[k, 0] * run.w[k, 0]).sum(-1) + run.b[k, 0]
+        window = run.u[k * seg : (k + 1) * seg, 0]
+
+        assert np.array_equal(window, np.full(seg, held)), (k, window[:3], held)
+
+    # the two windows' values really are different samples
+    assert run.u[seg - 1, 0] != run.u[seg, 0]
 
 
 def test_a_remainder_window_is_shorter():
