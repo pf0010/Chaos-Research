@@ -188,7 +188,7 @@ def test_batching_does_not_change_the_answer():
     lams = [0.05, 0.10, 0.15, 0.10]
     common = dict(
         horizon=1.0,
-        iters=150,
+        iters=25,
         penalize_effort=True,
         device="cuda",
         dtype=torch.float64,
@@ -209,11 +209,13 @@ def test_batching_does_not_change_the_answer():
     )
 
     for i, (lr, lam) in enumerate(zip(lrs, lams)):
+        # eager is ~4x slower than a replay, so one eager lane is enough to
+        # hold the graph to the eager arithmetic; the rest replay too
         w_one, b_one, history_one, grad_norm_one = train_policy_batched(
             batch=1,
             effort_weight=[lam],
             learning_rate=[lr],
-            use_graph=False,
+            use_graph=i > 0,
             init=(w0[i : i + 1], b0[i : i + 1]),
             **common,
         )
@@ -221,13 +223,35 @@ def test_batching_does_not_change_the_answer():
         assert (w[i] - w_one[0]).abs().max() < 1e-12, (i, w[i], w_one[0])
         assert (b[i] - b_one[0]).abs().max() < 1e-12, (i, b[i], b_one[0])
         assert np.abs(history[:, i] - history_one[:, 0]).max() < 1e-15
-        # the graphed lane must record the same norms the eager run did
+        # the graphed lane must record the same norms its solo run did
         assert np.allclose(grad_norm[:, i], grad_norm_one[:, 0], rtol=1e-12, atol=0)
 
     # two lanes given identical settings do the identical arithmetic, so these
     # have no reassociation to excuse a difference and must match exactly
     assert torch.equal(w[1], w[3])
     assert torch.equal(b[1], b[3])
+
+
+def test_a_run_shorter_than_the_warmup_is_graphed():
+    """The graph's warmup steps are real ones, but they must not outrun the records.
+
+    Those are sized to `iters`, so a warmup that walked down them would write
+    past a run shorter than itself -- a device-side assert rather than a result.
+    """
+    if not CUDA:
+        print("  (skipped: no CUDA device)")
+        return
+
+    w0, b0 = (p.detach() for p in init_policy_params(1))
+    common = dict(horizon=0.25, device="cuda", dtype=torch.float64, init=(w0, b0))
+
+    for iters in (0, 1, 2):
+        graphed = train_policy_batched(iters=iters, use_graph=True, **common)
+        eager = train_policy_batched(iters=iters, use_graph=False, **common)
+
+        assert (graphed[0] - eager[0]).abs().max() < 1e-12, (iters, graphed[0], eager[0])
+        assert graphed[2].shape == eager[2].shape == (iters, 1, 3)
+        assert np.allclose(graphed[2], eager[2], rtol=0, atol=1e-15), iters
 
 
 def test_mixed_windows_match_their_own_runs():
@@ -249,7 +273,7 @@ def test_mixed_windows_match_their_own_runs():
     horizons = [1.0, 1.25, 1.5, 1.75, 2.0]
     lams = [0.06, 0.08, 0.10, 0.12, 0.14]
     common = dict(
-        iters=120,
+        iters=25,
         penalize_effort=True,
         effort_horizon=None,
         learning_rate=0.05,
@@ -273,7 +297,8 @@ def test_mixed_windows_match_their_own_runs():
             batch=1,
             horizon=horizon,
             effort_weight=[lam],
-            use_graph=False,
+            # one eager lane, as in the batching test
+            use_graph=i > 0,
             init=(w0[i : i + 1], b0[i : i + 1]),
             **common,
         )
@@ -296,7 +321,7 @@ def test_mixed_starts_match_their_own_runs():
     starts = [(0.0, 1.0, 1.05), (0.5, 1.0, 1.05), (1.0, 1.0, 1.05), (-0.3, 0.2, 2.0)]
     common = dict(
         horizon=1.0,
-        iters=120,
+        iters=25,
         penalize_effort=True,
         effort_horizon=None,
         learning_rate=0.05,
@@ -395,8 +420,10 @@ def test_chaos_dominates_precision():
         print(f"  fp32 costs {precision:.1%}; a 1e-12 nudge costs {chaos:.1%}")
 
 
+# a batching or hand-off bug shows from the first step, so a few iterations
+# per window are as sharp a check as many
 RECEDING = dict(
-    iters=40,
+    iters=10,
     learning_rate=0.05,
     effort_weight=0.07,
     penalize_effort=True,

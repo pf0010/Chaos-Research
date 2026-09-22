@@ -414,6 +414,11 @@ def _replay_graphed(iteration, iters, params, opt, step_index, warmup=3):
     before capture -- so everything they touched is reset before the capture,
     the parameters back to the random draw they started from.
     """
+    # the records are sized to iters, so with none there is nothing a warmup
+    # could write into -- and nothing to train, as in the eager loop
+    if iters == 0:
+        return
+
     initial = [p.detach().clone() for p in params]
 
     stream = torch.cuda.Stream()
@@ -422,6 +427,9 @@ def _replay_graphed(iteration, iters, params, opt, step_index, warmup=3):
     with torch.cuda.stream(stream):
         for _ in range(warmup):
             iteration()
+            # every warmup writes row 0 of the records rather than walking
+            # down them, so a run shorter than the warmup stays in bounds
+            step_index.zero_()
 
     torch.cuda.current_stream().wait_stream(stream)
 
