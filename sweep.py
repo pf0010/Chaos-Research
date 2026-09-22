@@ -350,7 +350,7 @@ def draw_point(job):
     )
 
     # the plotters narrate to stdout, which from 100 workers is noise; the
-    # caller prints one line per point instead
+    # caller reports progress in 10% steps instead
     with contextlib.redirect_stdout(io.StringIO()):
         if loss_curve:
             plot_loss_curve(history, **shared)
@@ -693,8 +693,16 @@ if __name__ == "__main__":
     with ProcessPoolExecutor(max_workers=args.jobs) as pool:
         futures = [pool.submit(draw_point, job) for job in jobs]
 
+        # a line per figure buries the training log, so report in 10% steps;
+        # with fewer than ten points one figure can cross several steps, and
+        # only the highest is printed
+        shown = 0
         for done, future in enumerate(as_completed(futures), start=1):
-            print(f"[{done}/{len(jobs)}] drew {future.result()}", flush=True)
+            future.result()
+            percent = done * 100 // len(jobs) // 10 * 10
+            if percent > shown:
+                shown = percent
+                print(f"drew {percent}% of plots ({done}/{len(jobs)})", flush=True)
 
     print(f"finished in {time.monotonic() - started:.1f}s")
 
