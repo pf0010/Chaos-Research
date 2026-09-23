@@ -218,6 +218,9 @@ NESTED = [param.name for param in PARAMS if param.nested]
 SHAPING = [
     param.name for param in PARAMS if not param.batchable and not param.nested
 ]
+# what a sweep measured, written after the parameters in every csv row: the
+# fraction of time x > 0, and the time average of |u| that bought it
+RESULT_COLUMNS = ("success", "mean_abs_u")
 
 
 def resolve(name):

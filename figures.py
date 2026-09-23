@@ -27,6 +27,7 @@ from lorenz import (
 from params import (
     BY_NAME,
     DEFAULT_EFFORT_WEIGHT,
+    RESULT_COLUMNS,
     SWEEPABLE,
     decimal_tag,
     run_values,
@@ -672,7 +673,7 @@ def finish_training_curve(
         plt.show()
 
 
-# the success figure's axes are fixed: y is success, and x is the training
+# a sweep figure's axes are fixed: y is what it measured, and x is the training
 # window if the sweep varied it, otherwise the plot horizon. When both vary the
 # window keeps x and the horizon organizes panels like any other parameter
 X_KEYS = ("train_horizon", "plot_horizon")
@@ -710,13 +711,13 @@ def sweep_axis_order(path):
         return []
 
 
-def read_sweep_csv(path):
-    """Rows with a success value, plus which registry parameters actually vary."""
+def read_sweep_csv(path, column="success"):
+    """Rows with a `column` value, plus which registry parameters actually vary."""
     with open(path, newline="") as f:
-        rows = [row for row in csv.DictReader(f) if row["success"]]
+        rows = [row for row in csv.DictReader(f) if row.get(column)]
 
     if not rows:
-        raise SystemExit(f"no success values in {path}")
+        raise SystemExit(f"no {column} values in {path}")
 
     columns = [name for name in rows[0] if name in BY_NAME]
     # a column the grid held fixed belongs in the caption, not on an axis.
@@ -739,7 +740,7 @@ def read_sweep_csv(path):
         name
         for name in rows[0]
         if name not in BY_NAME
-        and name != "success"
+        and name not in RESULT_COLUMNS
         and len({row[name] for row in rows}) > 1
     ]
 
@@ -754,9 +755,58 @@ def read_sweep_csv(path):
 
 
 def plot_success(path, save=False):
-    """Success against the training window, one panel per hyperparameter combination.
+    """Success against the training window; see plot_sweep_metric."""
+    plot_sweep_metric(
+        path,
+        "success",
+        save=save,
+        y_label="success (fraction of time x > 0)",
+        title="Success",
+        file_stem="success",
+        ylim=(-0.03, 1.05),
+        best_label="best success",
+    )
 
-    The axes never move: y is the success metric and x is the training window,
+
+def plot_action(path, save=False):
+    """Each run's mean |u| against the training window; see plot_sweep_metric.
+
+    A csv from a sweep that predates the column has nothing to draw, and the
+    success figure beside it shouldn't fail for that, so it is skipped.
+    """
+    with open(path, newline="") as f:
+        header = next(csv.reader(f), [])
+
+    if "mean_abs_u" not in header:
+        print(f"no mean_abs_u column in {path}; skipping the action figure")
+        return
+
+    plot_sweep_metric(
+        path,
+        "mean_abs_u",
+        save=save,
+        y_label="mean |u| over the run",
+        title="Mean controller action",
+        file_stem="action",
+        best_label="lowest mean |u|",
+        lowest_best=True,
+    )
+
+
+def plot_sweep_metric(
+    path,
+    column,
+    save=False,
+    y_label=None,
+    title=None,
+    file_stem=None,
+    ylim=None,
+    best_label="best",
+    lowest_best=False,
+):
+    """A csv column against the training window, one panel per hyperparameter combination.
+
+    The axes never move: y is the measured column and x is the training window,
     so two sweeps can be laid side by side and read the same way. A sweep that
     held the window fixed puts the plot horizon on x instead. Everything
     else the grid varied organizes the figure instead -- one panel per
@@ -768,15 +818,22 @@ def plot_success(path, save=False):
     anything. Runs that differ only in where they started are the same
     experiment repeated, so they collapse into one line: the median, over
     bands spanning the ensemble.
+
+    y is pinned to `ylim` when given, and otherwise starts at zero and is shared
+    across panels. The value printed per page is the panel's best median, the
+    lowest when `lowest_best`.
     """
-    rows, columns, varying = read_sweep_csv(path)
+    rows, columns, varying = read_sweep_csv(path, column)
+    y_label = y_label or column
+    title_prefix = title or column
+    file_stem = file_stem or column
 
     x_key = next((name for name in X_KEYS if name in varying), None)
 
     if x_key is None:
         raise SystemExit(
             f"neither {' nor '.join(X_KEYS)} varies in {path}; this figure is "
-            f"success against one of them, so there is nothing to put on its x axis"
+            f"{column} against one of them, so there is nothing to put on its x axis"
         )
 
     organizing = [
@@ -808,7 +865,7 @@ def plot_success(path, save=False):
 
     for row in rows:
         key = (tuple(numeric(name, row) for name in organizing), numeric(x_key, row))
-        ensembles.setdefault(key, []).append(float(row["success"]))
+        ensembles.setdefault(key, []).append(float(row[column]))
 
     # the outermost parameters page the figure until what is left fits, so the
     # panels on a page stay big enough to read. The last one is never paged
@@ -919,12 +976,15 @@ def plot_success(path, save=False):
                     fontsize=9,
                 )
 
-            ax.set_ylim(-0.03, 1.05)
+            if ylim:
+                ax.set_ylim(*ylim)
+            else:
+                ax.set_ylim(bottom=0)
             ax.grid(alpha=0.25, linewidth=0.6)
 
-            top = max(centres)
+            top = min(centres) if lowest_best else max(centres)
 
-            if best is None or top > best[0]:
+            if best is None or (top < best[0] if lowest_best else top > best[0]):
                 best = (top, xs[centres.index(top)], held)
 
         for ax in grid[len(panels) :]:
@@ -960,9 +1020,9 @@ def plot_success(path, save=False):
         # strip to itself
         below = 0.14 * text.count("\n")
         fig.supxlabel(x_param.label, y=(0.20 + below) / height)
-        fig.supylabel("success (fraction of time x > 0)")
+        fig.supylabel(y_label)
 
-        title = f"Success vs. {x_param.label}"
+        title = f"{title_prefix} vs. {x_param.label}"
 
         # the parameter labels are sentences rather than symbols, so three of
         # them on one line would be wider than the panels underneath
@@ -1010,7 +1070,7 @@ def plot_success(path, save=False):
 
         if best:
             print(
-                f"{where}best success {best[0]:.4f} at {x_key}={best[1]}"
+                f"{where}{best_label} {best[0]:.4f} at {x_key}={best[1]}"
                 + (
                     "  " + "  ".join(label(n, v) for n, v in best[2].items())
                     if best[2]
@@ -1025,11 +1085,11 @@ def plot_success(path, save=False):
             if len(pages) > 1:
                 out = os.path.join(
                     out_dir,
-                    f"success_v_{x_param.key}",
+                    f"{file_stem}_v_{x_param.key}",
                     stem(page, page_keys) + ".png",
                 )
             else:
-                out = os.path.join(out_dir, f"success_v_{x_param.key}.png")
+                out = os.path.join(out_dir, f"{file_stem}_v_{x_param.key}.png")
 
             os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
             fig.savefig(out, dpi=150, bbox_inches="tight")

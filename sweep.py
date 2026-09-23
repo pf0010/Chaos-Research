@@ -53,6 +53,7 @@ everything it produces into that one directory:
         manifest.json               # the axes, the constants, the git sha
         success.csv                 # one row per grid point, every parameter
         success_v_th.png            # unless -np (success_v_ph.png if th is fixed)
+        action_v_th.png             # the same figure for each run's mean |u|
         attractor/                  # one png per grid point
         loss_v_iteration/           # one png per grid point, with -loss
         grad_norm_v_iteration/      # one png per grid point, with -gn
@@ -87,6 +88,7 @@ from params import (
     BATCHABLE,
     NESTED,
     PARAMS,
+    RESULT_COLUMNS,
     SHAPING,
     SWEEPABLE,
     csv_value,
@@ -149,9 +151,10 @@ def latest_sweep_csv():
 
 def plot_csv(path, save):
     # imported here so a plain sweep doesn't pay for torch and matplotlib
-    from figures import plot_success
+    from figures import plot_action, plot_success
 
     plot_success(path, save=save)
+    plot_action(path, save=save)
 
 
 def git_sha():
@@ -258,16 +261,20 @@ def lanes_of(group):
 
 
 def train_group(group, device, dtype, use_graph):
-    """Train one batch of receding-horizon runs: (values, run, success) per point.
+    """Train one batch of receding-horizon runs: (values, run, success, action) per point.
 
     Each lane is trained once, to the longest plot horizon in the group, and
     every point on it is read off that run at its own horizon. Each lane's
     start is resolved here -- given, or drawn from its seed -- and written back
     into its points' values, so the csv and the captions record where a random
     run actually began. Success is read off the point's stitched trajectory,
-    the same one that is drawn for it.
+    the same one that is drawn for it, and so is the action: the time average
+    of |u| over it. u's last entry repeats the one before it rather than acting
+    over a step of its own, so it is left out of the average.
     """
     # imported here so --dry-run and -sc don't pay for torch and matplotlib
+    import numpy as np
+
     from lorenz import euler_step, rk4_step
     from training import success_fraction, train_receding_prefixes
 
@@ -303,7 +310,12 @@ def train_group(group, device, dtype, use_graph):
     )
 
     return [
-        (values, run, float(success_fraction(run.traj)))
+        (
+            values,
+            run,
+            float(success_fraction(run.traj)),
+            float(np.mean(np.abs(run.u[:-1]))),
+        )
         for points, lane_runs in zip(lanes, runs)
         for values in points
         for run in [lane_runs[horizons.index(values["plot_horizon"])]]
@@ -381,15 +393,15 @@ def write_csv(path, rows, axis_names):
 
     with open(path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow([*columns, "success"])
+        writer.writerow([*columns, *RESULT_COLUMNS])
 
-        for values, success in sorted(
+        for values, *results in sorted(
             rows, key=lambda row: [row[0][name] for name in axis_names]
         ):
             writer.writerow(
                 [
                     *(csv_value(name, values[name]) for name in columns),
-                    "" if success is None else f"{success:.6f}",
+                    *("" if result is None else f"{result:.6f}" for result in results),
                 ]
             )
 
@@ -652,7 +664,7 @@ if __name__ == "__main__":
         at = time.monotonic()
         results = train_group(group, device, dtype, use_graph)
         elapsed = time.monotonic() - at
-        successes = [success for *_, success in results]
+        successes = [success for _, _, success, _ in results]
 
         held = "  ".join(
             f"{name}={group[0][name]}" for name in SHAPING if name in axis_names
@@ -665,8 +677,8 @@ if __name__ == "__main__":
             flush=True,
         )
 
-        for values, run, success in results:
-            rows.append((values, success))
+        for values, run, success, action in results:
+            rows.append((values, success, action))
             jobs.append(
                 (
                     values,
