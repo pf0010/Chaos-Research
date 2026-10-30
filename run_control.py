@@ -7,18 +7,11 @@
     python run_control.py -gn -s               # and a gradient norm vs. iteration
     python run_control.py -sg -s               # ∂L/∂state through the window
     python run_control.py -lgh 8               # loss-gradient vs. horizon
-    python run_control.py -xth 0               # control only windows starting at x < 0
-    python run_control.py -xth inf             # every window controlled
-    python run_control.py -umax 5              # |u| clipped to 5
-    python run_control.py -umax inf            # no cap
 
 The projected horizon -ph is cut into windows of -th Lyapunov times. Each
-window trains its own law u = w·s + b for -i iterations from where the previous
-window's law left the system, starting from that law. The law is sampled once,
-at the window's start, and that u is held over the whole window; the trajectory
-stitched from those windows is what is scored and drawn. A window whose start
-has x at or past -xth holds no control at all, and every held u is clipped to
-±-umax.
+window trains its own feedback law for -i iterations from where the previous
+window's law left the system, starting from that law; the trajectory stitched
+from those windows is what is scored and drawn.
 
 The start is -ic if given, otherwise a random point on the attractor drawn from
 -seed (itself drawn and printed when not given, so any run can be repeated).
@@ -41,14 +34,7 @@ from figures import (
     plot_state_gradient_through_window,
 )
 from lorenz import euler_step, rk4_step
-from params import (
-    DEFAULT_EFFORT_WEIGHT,
-    DEFAULT_U_MAX,
-    DEFAULT_X_THRESHOLD,
-    SWEEPABLE,
-    resolve,
-    resolve_start,
-)
+from params import DEFAULT_EFFORT_WEIGHT, SWEEPABLE, resolve, resolve_start
 from training import train_policy
 
 if __name__ == "__main__":
@@ -75,21 +61,6 @@ if __name__ == "__main__":
     parser.add_argument("-i", "--iters", type=int, default=600)
     parser.add_argument(
         "-lam", "--effort_weight", type=float, default=DEFAULT_EFFORT_WEIGHT
-    )
-    parser.add_argument(
-        "-xth",
-        "--x_threshold",
-        type=float,
-        default=DEFAULT_X_THRESHOLD,
-        help="a window is controlled only if it starts with x below this; "
-        "inf for always",
-    )
-    parser.add_argument(
-        "-umax",
-        "--u_max",
-        type=float,
-        default=DEFAULT_U_MAX,
-        help="hard cap on |u|: the held control is clipped to ±this; inf for none",
     )
     parser.add_argument("-lgh", "--loss_gradient_horizon", type=float, default=0)
     parser.add_argument(
@@ -187,8 +158,6 @@ if __name__ == "__main__":
             iters=args.iters,
             penalize_effort=penalize_effort,
             effort_weight=args.effort_weight,
-            x_threshold=args.x_threshold,
-            u_max=args.u_max,
             integrator=integrator,
             record_params=args.state_gradient,
             device=args.device,
@@ -205,8 +174,6 @@ if __name__ == "__main__":
             iters=args.iters,
             penalize_effort=penalize_effort,
             effort_weight=args.effort_weight,
-            x_threshold=args.x_threshold,
-            u_max=args.u_max,
             integrator=integrator,
             save=args.save,
             out_dir=args.out_dir,

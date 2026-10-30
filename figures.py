@@ -20,7 +20,6 @@ from mpl_toolkits.mplot3d.art3d import Line3DCollection
 from lorenz import (
     DT,
     LYAPUNOV_EXP,
-    limit_control,
     rk4_step,
     rollout_numpy,
     rollout_torch,
@@ -28,8 +27,6 @@ from lorenz import (
 from params import (
     BY_NAME,
     DEFAULT_EFFORT_WEIGHT,
-    DEFAULT_U_MAX,
-    DEFAULT_X_THRESHOLD,
     RESULT_COLUMNS,
     SWEEPABLE,
     decimal_tag,
@@ -145,9 +142,7 @@ def wrap_caption(caption, width):
 
 
 def rollout_closed_loop(params, state0=(0, 1, 1.05), steps=300, integrator=rk4_step):
-    # per-step feedback, not the held control training uses: only reached when
-    # plot_run_summary is given no trajectory, which no caller does.
-    # The trajectory is only ever plotted, and taping a rollout this long costs
+    # the trajectory is only ever plotted, and taping a rollout this long costs
     # about as much again as integrating it
     with torch.no_grad():
         traj = rollout_torch(
@@ -266,9 +261,8 @@ def plot_state_and_control(
     ax_traj.legend(loc="upper right")
 
     ax_u.axhline(0, color="black", linestyle="--", linewidth=1)
-    # u[t] acts from t to t+1, held over each window
-    ax_u.plot(times, u, color="crimson", linewidth=0.6, drawstyle="steps-post")
-    ax_u.set_ylabel("control u (held per window)")
+    ax_u.plot(times, u, color="crimson", linewidth=0.6)
+    ax_u.set_ylabel("control u = w·s + b")
     ax_u.set_xlabel("Lyapunov times (t / τ)")
     ax_u.set_title("Controller action")
 
@@ -345,11 +339,14 @@ def plot_loss_gradient_vs_horizon(
     norms = []
     # one draw for every horizon, so the curve moves with the window alone
     params = init_policy_params()
-    # sampled at the start and held over the window, as in training
-    u = linear_policy(params, torch.as_tensor(state0, dtype=torch.float64))
     for horizon in horizons:
         steps = round(horizon / (LYAPUNOV_EXP * DT))
-        traj = rollout_torch(state0, u, steps=steps, integrator=integrator)
+        traj = rollout_torch(
+            state0,
+            lambda s: linear_policy(params, s),
+            steps=steps,
+            integrator=integrator,
+        )
         grads = torch.autograd.grad(task_loss(traj), params)
         norms.append(torch.cat([g.reshape(-1) for g in grads]).norm().item())
 
@@ -393,8 +390,6 @@ def plot_loss_curve(
     iters=600,
     penalize_effort=True,
     effort_weight=DEFAULT_EFFORT_WEIGHT,
-    x_threshold=DEFAULT_X_THRESHOLD,
-    u_max=DEFAULT_U_MAX,
     integrator=rk4_step,
     save=False,
     out_dir=None,
@@ -430,8 +425,6 @@ def plot_loss_curve(
         iters=iters,
         penalize_effort=penalize_effort,
         effort_weight=effort_weight,
-        x_threshold=x_threshold,
-        u_max=u_max,
         integrator=integrator,
         save=save,
         out_dir=out_dir,
@@ -449,8 +442,6 @@ def plot_grad_norm_curve(
     iters=600,
     penalize_effort=True,
     effort_weight=DEFAULT_EFFORT_WEIGHT,
-    x_threshold=DEFAULT_X_THRESHOLD,
-    u_max=DEFAULT_U_MAX,
     integrator=rk4_step,
     save=False,
     out_dir=None,
@@ -491,8 +482,6 @@ def plot_grad_norm_curve(
         iters=iters,
         penalize_effort=penalize_effort,
         effort_weight=effort_weight,
-        x_threshold=x_threshold,
-        u_max=u_max,
         integrator=integrator,
         save=save,
         out_dir=out_dir,
@@ -510,8 +499,6 @@ def plot_state_gradient_through_window(
     iters=600,
     penalize_effort=True,
     effort_weight=DEFAULT_EFFORT_WEIGHT,
-    x_threshold=DEFAULT_X_THRESHOLD,
-    u_max=DEFAULT_U_MAX,
     integrator=rk4_step,
     save=False,
     out_dir=None,
@@ -543,6 +530,10 @@ def plot_state_gradient_through_window(
     b = torch.as_tensor(seen[rows, 3])
     steps = round(train_horizon / (LYAPUNOV_EXP * DT))
 
+    # the same objective training differentiated: every window's penalty is
+    # pathwise over that window, so it reaches the states like the task does
+    pathwise = penalize_effort
+
     row_starts = (
         np.asarray(starts, dtype=float)[rows // iters]
         if starts is not None
@@ -550,22 +541,17 @@ def plot_state_gradient_through_window(
     )
     state = torch.as_tensor(row_starts).clone().requires_grad_()
     states = [state]
-    # the same objective training differentiated: each row's law sampled at
-    # its window's start and held over the window, gated on that start and capped
-    u = limit_control(
-        linear_policy((w, b), state), state[:, 0], x_threshold, u_max
-    )
 
     for _ in range(steps):
-        state, _ = integrator(state, u)
+        state, _ = integrator(state, lambda s: linear_policy((w, b), s))
         state.retain_grad()
         states.append(state)
 
     traj = torch.stack(states)
     loss = task_loss(traj)
 
-    if penalize_effort:
-        loss = loss + effort_weight * effort_penalty(u)
+    if pathwise:
+        loss = loss + effort_weight * effort_penalty(traj, (w, b))
 
     loss.sum().backward()
 
@@ -635,8 +621,6 @@ def plot_state_gradient_through_window(
         iters=iters,
         penalize_effort=penalize_effort,
         effort_weight=effort_weight,
-        x_threshold=x_threshold,
-        u_max=u_max,
         integrator=integrator,
         save=save,
         out_dir=out_dir,
@@ -660,8 +644,6 @@ def finish_training_curve(
     out_dir,
     name_keys,
     seed=None,
-    x_threshold=DEFAULT_X_THRESHOLD,
-    u_max=DEFAULT_U_MAX,
 ):
     """Caption a per-iteration figure, then save it under `subdir` or show it."""
     values = run_values(
@@ -672,8 +654,6 @@ def finish_training_curve(
         plot_horizon=plot_horizon,
         iters=iters,
         effort_weight=effort_weight,
-        x_threshold=x_threshold,
-        u_max=u_max,
         penalize_effort=penalize_effort,
         rk4=integrator is rk4_step,
     )
@@ -1135,8 +1115,6 @@ def plot_run_summary(
     penalize_effort=True,
     save=False,
     effort_weight=DEFAULT_EFFORT_WEIGHT,
-    x_threshold=DEFAULT_X_THRESHOLD,
-    u_max=DEFAULT_U_MAX,
     integrator=rk4_step,
     traj=None,
     u=None,
@@ -1164,8 +1142,6 @@ def plot_run_summary(
         plot_horizon=plot_horizon,
         iters=iters,
         effort_weight=effort_weight,
-        x_threshold=x_threshold,
-        u_max=u_max,
         penalize_effort=penalize_effort,
         rk4=integrator is rk4_step,
     )

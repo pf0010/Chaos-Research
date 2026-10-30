@@ -22,8 +22,6 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 DEFAULT_EFFORT_WEIGHT = 0.07
-DEFAULT_X_THRESHOLD = 2.0
-DEFAULT_U_MAX = 10.0
 
 TRUE_WORDS = {"1", "true", "on", "yes"}
 FALSE_WORDS = {"0", "false", "off", "no"}
@@ -185,30 +183,6 @@ PARAMS = (
         DEFAULT_EFFORT_WEIGHT,
         float,
         _decimal(3),
-        batchable=True,
-    ),
-    Param(
-        "x_threshold",
-        "xth",
-        "-xth",
-        "control acts while x <",
-        DEFAULT_X_THRESHOLD,
-        float,
-        # inf, which turns the gate off, formats as `inf`
-        _decimal(2),
-        # a per-element number the policy carries, like λ, so a sweep over it
-        # rides the batch axis
-        batchable=True,
-    ),
-    Param(
-        "u_max",
-        "umax",
-        "-umax",
-        "|u| capped at",
-        DEFAULT_U_MAX,
-        float,
-        # inf, which removes the cap, formats as `inf`
-        _decimal(2),
         batchable=True,
     ),
     Param(

@@ -50,7 +50,7 @@ Each sweep claims the next number from plots/.sweep_counter and writes
 everything it produces into that one directory:
 
     plots/sweep_007/
-        manifest.json               # the axes, the constants, the git sha
+        manifest.json               # the axes, the constants, the git sha, the run time
         success.csv                 # one row per grid point, every parameter
         success_v_th.png            # unless -np (success_v_ph.png if th is fixed)
         action_v_th.png             # the same figure for each run's mean |u|
@@ -194,8 +194,6 @@ def build_base(args, axes):
             ("learning_rate", args.learning_rate),
             ("plot_horizon", args.plot_horizon),
             ("iters", args.iters),
-            ("x_threshold", args.x_threshold),
-            ("u_max", args.u_max),
         )
         if value is not None
     }
@@ -303,8 +301,6 @@ def train_group(group, device, dtype, use_graph):
         iters=settings["iters"],
         learning_rate=[values["learning_rate"] for values in heads],
         effort_weight=[values["effort_weight"] for values in heads],
-        x_threshold=[values["x_threshold"] for values in heads],
-        u_max=[values["u_max"] for values in heads],
         penalize_effort=settings["penalize_effort"],
         integrator=integrator,
         device=device,
@@ -359,8 +355,6 @@ def draw_point(job):
         iters=values["iters"],
         penalize_effort=values["penalize_effort"],
         effort_weight=values["effort_weight"],
-        x_threshold=values["x_threshold"],
-        u_max=values["u_max"],
         integrator=rk4_step_if(values["rk4"]),
         save=True,
         out_dir=sweep_dir,
@@ -447,6 +441,24 @@ def write_manifest(path, axes, base, name_keys, args, grid_size, runtime):
     print(f"wrote {path}")
 
 
+def record_elapsed(path, trained, total):
+    """Add the sweep's wall-clock times to the manifest written at its start.
+
+    Only a sweep that got through its figures reaches this, so a manifest
+    without them is one that was interrupted.
+    """
+    with open(path) as f:
+        manifest = json.load(f)
+
+    manifest["train_seconds"] = round(trained, 1)
+    manifest["draw_seconds"] = round(total - trained, 1)
+    manifest["elapsed_seconds"] = round(total, 1)
+
+    with open(path, "w") as f:
+        json.dump(manifest, f, indent=2, sort_keys=False)
+        f.write("\n")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -508,21 +520,6 @@ if __name__ == "__main__":
     parser.add_argument("-lr", "--learning_rate", type=float, default=None)
     parser.add_argument("-ph", "--plot_horizon", type=float, default=None)
     parser.add_argument("-i", "--iters", type=int, default=None)
-    parser.add_argument(
-        "-xth",
-        "--x_threshold",
-        type=float,
-        default=None,
-        help="a window is controlled only if it starts with x below this; "
-        "inf for always",
-    )
-    parser.add_argument(
-        "-umax",
-        "--u_max",
-        type=float,
-        default=None,
-        help="hard cap on |u|: the held control is clipped to ±this; inf for none",
-    )
 
     parser.add_argument(
         "--csv",
@@ -663,8 +660,9 @@ if __name__ == "__main__":
         + (", CUDA graph captured" if use_graph and device == "cuda" else "")
     )
 
+    manifest_path = os.path.join(sweep_dir, "manifest.json")
     write_manifest(
-        os.path.join(sweep_dir, "manifest.json"),
+        manifest_path,
         axes,
         base,
         name_keys,
@@ -737,7 +735,9 @@ if __name__ == "__main__":
                 shown = percent
                 print(f"drew {percent}% of plots ({done}/{len(jobs)})", flush=True)
 
-    print(f"finished in {time.monotonic() - started:.1f}s")
+    total = time.monotonic() - started
+    print(f"finished in {total:.1f}s")
+    record_elapsed(manifest_path, trained, total)
 
     write_csv(csv_path, rows, axis_names)
 
