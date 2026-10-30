@@ -2,10 +2,14 @@
 
 The policy is a linear law u = w·s + b, sampled once at the start of each
 window -- where the previous window ended -- and held constant over the whole
-window. It is trained by differentiating straight through the integrator, so
-the training window is limited by how far the gradient survives the
-attractor's exponential stretching. With the start fixed while a window
-trains, the loss sees (w, b) only through that one held u.
+window -- but only if that start has x < x_threshold, and clipped to ±u_max; a
+window starting past the threshold holds no control at all
+(lorenz.limit_control). It is trained by differentiating straight through the
+integrator, so the training window is limited by how far the gradient survives
+the attractor's exponential stretching. With the start fixed while a window
+trains, the loss sees (w, b) only through that one held u, and a gated-off or
+clipped window not at all: its gradient is zero, so Adam leaves its law where
+it is.
 
 That limit is why control is receding-horizon (train_receding_horizon): the
 projected horizon is cut into short windows, each window trains its own law
@@ -30,8 +34,15 @@ import numpy as np
 import torch
 
 from kernels import default_dtype, moment_stats, resolve_device
-from lorenz import DT, LYAPUNOV_EXP, rk4_step, rollout_numpy_batched, rollout_torch
-from params import DEFAULT_EFFORT_WEIGHT
+from lorenz import (
+    DT,
+    LYAPUNOV_EXP,
+    limit_control,
+    rk4_step,
+    rollout_numpy_batched,
+    rollout_torch,
+)
+from params import DEFAULT_EFFORT_WEIGHT, DEFAULT_U_MAX, DEFAULT_X_THRESHOLD
 
 SOFTNESS = 2
 U_REF = 60.0
@@ -221,14 +232,16 @@ def train_policy_batched(
     use_graph=True,
     init=None,
     record_params=False,
+    x_threshold=DEFAULT_X_THRESHOLD,
+    u_max=DEFAULT_U_MAX,
 ):
     """Train `batch` independent policies at once.
 
-    `state0`, `learning_rate`, `effort_weight` and `horizon` may each be a
-    scalar (or single start) or a length-`batch` sequence; those are the axes a
-    grid can vary within one run. The middle two are per-element numbers the
-    arithmetic carries anyway, and `state0` is already a (batch, 3) tensor
-    here, so one start per lane costs nothing the shared start didn't.
+    `state0`, `learning_rate`, `effort_weight`, `x_threshold`, `u_max` and
+    `horizon` may each be a scalar (or single start) or a length-`batch`
+    sequence; those are the axes a grid can vary within one run. The middle four are per-element
+    numbers the arithmetic carries anyway, and `state0` is already a (batch, 3)
+    tensor here, so one start per lane costs nothing the shared start didn't.
     `horizon` is the interesting one: it does change the step count, so the
     batch integrates to the longest window in it and each lane's loss is
     masked back to its own -- which costs max(steps) rather than sum(steps).
@@ -269,6 +282,10 @@ def train_policy_batched(
 
     lam = _as_batch(effort_weight, batch, device, dtype)
     lr = _as_batch(learning_rate, batch, device, dtype)
+    # tensors on the device before capture, so limit_control converts nothing
+    # inside the graph
+    x_threshold = _as_batch(x_threshold, batch, device, dtype)
+    u_max = _as_batch(u_max, batch, device, dtype)
 
     if init is None:
         w, b = init_policy_params(batch, device=device, dtype=dtype)
@@ -298,8 +315,12 @@ def train_policy_batched(
     def iteration():
         # sampled once, at the window's start, and held over every step and
         # every RK4 stage of it: a tensor rather than a callable, so
-        # eval_control hands the integrator the same u throughout
-        u = linear_policy((w, b), state0)
+        # eval_control hands the integrator the same u throughout. Gated on
+        # that start too, so a lane past the threshold holds zero, and capped at
+        # ±u_max; either way a limited lane gets no gradient, task or effort
+        u = limit_control(
+            linear_policy((w, b), state0), state0[:, 0], x_threshold, u_max
+        )
         traj = rollout_torch(state0, u, steps=steps, integrator=integrator)
         task = task_loss(traj, mask=task_mask)
         effort = effort_penalty(u)
@@ -427,6 +448,9 @@ class RecedingRun(NamedTuple):
     `init_w`, `init_b` are the law the first window started from, `seg` each
     lane's window in steps and `steps` how many steps each lane ran, which is
     what reading a shorter run off this one needs (train_receding_prefixes).
+    `x_threshold` and `u_max` are each lane's gate and cap
+    (lorenz.limit_control): a window whose start is past the gate holds u = 0,
+    its law carried over from the window before, and |u| never exceeds the cap.
     Past its own `steps` a lane's `traj` and `u` are nan.
     """
 
@@ -443,6 +467,8 @@ class RecedingRun(NamedTuple):
     init_b: Optional[np.ndarray] = None  # (B,)
     seg: Optional[np.ndarray] = None  # (B,)
     steps: Optional[np.ndarray] = None  # (B,)
+    x_threshold: Optional[np.ndarray] = None  # (B,)
+    u_max: Optional[np.ndarray] = None  # (B,)
 
     def lane(self, i):
         """Lane i alone, its padding dropped: every array loses the batch axis."""
@@ -464,6 +490,8 @@ class RecedingRun(NamedTuple):
             init_b=self.init_b[i],
             seg=int(self.seg[i]),
             steps=steps,
+            x_threshold=float(self.x_threshold[i]),
+            u_max=float(self.u_max[i]),
         )
 
 
@@ -496,6 +524,8 @@ def train_receding_horizon(
     init=None,
     record_params=False,
     verbose=False,
+    x_threshold=DEFAULT_X_THRESHOLD,
+    u_max=DEFAULT_U_MAX,
 ):
     """Receding-horizon control: a law per window, each trained from where the last ended.
 
@@ -508,10 +538,12 @@ def train_receding_horizon(
     first window starts from a random law, and Adam starts afresh every window.
     The trained law is then applied over its window to find where the next one
     starts: rolled out with the law as it finished, not as it stood at the last
-    gradient, which is one Adam step behind.
+    gradient, which is one Adam step behind. A window whose start has x at or
+    past `x_threshold` holds u = 0 instead, which leaves its law untrained, and
+    every held u is clipped to ±`u_max`.
 
-    `state0`, `learning_rate`, `effort_weight` and `window` may each be per
-    lane, as in train_policy_batched. A lane with a longer window runs out of
+    `state0`, `learning_rate`, `effort_weight`, `x_threshold`, `u_max` and
+    `window` may each be per lane, as in train_policy_batched. A lane with a longer window runs out of
     windows first; it then sits out the rest with a learning rate of zero,
     which leaves its law exactly where it was.
     """
@@ -531,6 +563,8 @@ def train_receding_horizon(
     windows = -(-totals // seg)
     n = int(windows.max())
     lr = np.broadcast_to(np.asarray(learning_rate, dtype=float), (batch,))
+    x_threshold = np.broadcast_to(np.asarray(x_threshold, dtype=float), (batch,))
+    u_max = np.broadcast_to(np.asarray(u_max, dtype=float), (batch,))
 
     current = np.broadcast_to(np.asarray(state0, dtype=float), (batch, 3)).copy()
     # nan past a lane's own horizon, which a different window can leave short
@@ -571,6 +605,8 @@ def train_receding_horizon(
             use_graph=use_graph,
             init=init,
             record_params=record_params,
+            x_threshold=x_threshold,
+            u_max=u_max,
         )
 
         w = w.cpu().double().numpy()
@@ -585,7 +621,13 @@ def train_receding_horizon(
         # apply the law over its window. float64 on the cpu like every other
         # rollout that is scored, whatever precision the training ran in
         piece, controls = rollout_numpy_batched(
-            current, w, b, steps=int(steps[live].max()), integrator=integrator
+            current,
+            w,
+            b,
+            steps=int(steps[live].max()),
+            integrator=integrator,
+            x_threshold=x_threshold,
+            u_max=u_max,
         )
 
         for i in np.flatnonzero(live):
@@ -619,6 +661,8 @@ def train_receding_horizon(
         init_b=init_b,
         seg=seg,
         steps=totals,
+        x_threshold=x_threshold.copy(),
+        u_max=u_max.copy(),
     )
 
 
@@ -638,6 +682,8 @@ def train_receding_prefixes(
     init=None,
     record_params=False,
     verbose=False,
+    x_threshold=DEFAULT_X_THRESHOLD,
+    u_max=DEFAULT_U_MAX,
 ):
     """Receding-horizon runs to several total horizons, trained as one.
 
@@ -672,11 +718,14 @@ def train_receding_prefixes(
         init=init,
         record_params=record_params,
         verbose=verbose,
+        x_threshold=x_threshold,
+        u_max=u_max,
     )
 
     windows_lt = np.broadcast_to(np.asarray(window, dtype=float), (batch,))
     lrs = np.broadcast_to(np.asarray(learning_rate, dtype=float), (batch,))
     lams = np.broadcast_to(np.asarray(effort_weight, dtype=float), (batch,))
+    gates, caps = run.x_threshold, run.u_max
     lanes = [run.lane(i) for i in range(batch)]
 
     # (lane, horizon index, whole windows, remainder steps) for every horizon
@@ -704,6 +753,8 @@ def train_receding_prefixes(
             branches,
             lrs,
             lams,
+            gates,
+            caps,
             verbose,
             iters=iters,
             penalize_effort=penalize_effort,
@@ -740,7 +791,7 @@ def _cut(lane, whole, steps, iters):
     )
 
 
-def _train_branches(runs, lanes, branches, lrs, lams, verbose, **common):
+def _train_branches(runs, lanes, branches, lrs, lams, gates, caps, verbose, **common):
     """Train every remainder window at once and fill in each one's run.
 
     `common` is what train_policy_batched takes that every branch shares.
@@ -770,6 +821,8 @@ def _train_branches(runs, lanes, branches, lrs, lams, verbose, **common):
         horizon=rests * unit,
         learning_rate=lrs[picks],
         effort_weight=lams[picks],
+        x_threshold=gates[picks],
+        u_max=caps[picks],
         init=(np.array(laws_w), np.array(laws_b)),
         **common,
     )
@@ -777,7 +830,13 @@ def _train_branches(runs, lanes, branches, lrs, lams, verbose, **common):
     w = w.cpu().double().numpy()
     b = b.cpu().double().numpy()
     piece, controls = rollout_numpy_batched(
-        np.array(starts), w, b, steps=int(rests.max()), integrator=common["integrator"]
+        np.array(starts),
+        w,
+        b,
+        steps=int(rests.max()),
+        integrator=common["integrator"],
+        x_threshold=gates[picks],
+        u_max=caps[picks],
     )
 
     if verbose:
@@ -857,6 +916,8 @@ def train_policy(
     device=None,
     dtype=None,
     use_graph=True,
+    x_threshold=DEFAULT_X_THRESHOLD,
+    u_max=DEFAULT_U_MAX,
 ):
     """One receding-horizon run, as a batch of one: its RecedingRun, batch axis dropped."""
     return train_receding_horizon(
@@ -874,6 +935,8 @@ def train_policy(
         use_graph=use_graph,
         record_params=record_params,
         verbose=verbose,
+        x_threshold=x_threshold,
+        u_max=u_max,
     ).lane(0)
 
 

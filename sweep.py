@@ -194,6 +194,8 @@ def build_base(args, axes):
             ("learning_rate", args.learning_rate),
             ("plot_horizon", args.plot_horizon),
             ("iters", args.iters),
+            ("x_threshold", args.x_threshold),
+            ("u_max", args.u_max),
         )
         if value is not None
     }
@@ -301,6 +303,8 @@ def train_group(group, device, dtype, use_graph):
         iters=settings["iters"],
         learning_rate=[values["learning_rate"] for values in heads],
         effort_weight=[values["effort_weight"] for values in heads],
+        x_threshold=[values["x_threshold"] for values in heads],
+        u_max=[values["u_max"] for values in heads],
         penalize_effort=settings["penalize_effort"],
         integrator=integrator,
         device=device,
@@ -355,6 +359,8 @@ def draw_point(job):
         iters=values["iters"],
         penalize_effort=values["penalize_effort"],
         effort_weight=values["effort_weight"],
+        x_threshold=values["x_threshold"],
+        u_max=values["u_max"],
         integrator=rk4_step_if(values["rk4"]),
         save=True,
         out_dir=sweep_dir,
@@ -502,6 +508,21 @@ if __name__ == "__main__":
     parser.add_argument("-lr", "--learning_rate", type=float, default=None)
     parser.add_argument("-ph", "--plot_horizon", type=float, default=None)
     parser.add_argument("-i", "--iters", type=int, default=None)
+    parser.add_argument(
+        "-xth",
+        "--x_threshold",
+        type=float,
+        default=None,
+        help="a window is controlled only if it starts with x below this; "
+        "inf for always",
+    )
+    parser.add_argument(
+        "-umax",
+        "--u_max",
+        type=float,
+        default=None,
+        help="hard cap on |u|: the held control is clipped to ±this; inf for none",
+    )
 
     parser.add_argument(
         "--csv",

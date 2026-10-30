@@ -20,6 +20,7 @@ from mpl_toolkits.mplot3d.art3d import Line3DCollection
 from lorenz import (
     DT,
     LYAPUNOV_EXP,
+    limit_control,
     rk4_step,
     rollout_numpy,
     rollout_torch,
@@ -27,6 +28,8 @@ from lorenz import (
 from params import (
     BY_NAME,
     DEFAULT_EFFORT_WEIGHT,
+    DEFAULT_U_MAX,
+    DEFAULT_X_THRESHOLD,
     RESULT_COLUMNS,
     SWEEPABLE,
     decimal_tag,
@@ -390,6 +393,8 @@ def plot_loss_curve(
     iters=600,
     penalize_effort=True,
     effort_weight=DEFAULT_EFFORT_WEIGHT,
+    x_threshold=DEFAULT_X_THRESHOLD,
+    u_max=DEFAULT_U_MAX,
     integrator=rk4_step,
     save=False,
     out_dir=None,
@@ -425,6 +430,8 @@ def plot_loss_curve(
         iters=iters,
         penalize_effort=penalize_effort,
         effort_weight=effort_weight,
+        x_threshold=x_threshold,
+        u_max=u_max,
         integrator=integrator,
         save=save,
         out_dir=out_dir,
@@ -442,6 +449,8 @@ def plot_grad_norm_curve(
     iters=600,
     penalize_effort=True,
     effort_weight=DEFAULT_EFFORT_WEIGHT,
+    x_threshold=DEFAULT_X_THRESHOLD,
+    u_max=DEFAULT_U_MAX,
     integrator=rk4_step,
     save=False,
     out_dir=None,
@@ -482,6 +491,8 @@ def plot_grad_norm_curve(
         iters=iters,
         penalize_effort=penalize_effort,
         effort_weight=effort_weight,
+        x_threshold=x_threshold,
+        u_max=u_max,
         integrator=integrator,
         save=save,
         out_dir=out_dir,
@@ -499,6 +510,8 @@ def plot_state_gradient_through_window(
     iters=600,
     penalize_effort=True,
     effort_weight=DEFAULT_EFFORT_WEIGHT,
+    x_threshold=DEFAULT_X_THRESHOLD,
+    u_max=DEFAULT_U_MAX,
     integrator=rk4_step,
     save=False,
     out_dir=None,
@@ -538,8 +551,10 @@ def plot_state_gradient_through_window(
     state = torch.as_tensor(row_starts).clone().requires_grad_()
     states = [state]
     # the same objective training differentiated: each row's law sampled at
-    # its window's start and held over the window
-    u = linear_policy((w, b), state)
+    # its window's start and held over the window, gated on that start and capped
+    u = limit_control(
+        linear_policy((w, b), state), state[:, 0], x_threshold, u_max
+    )
 
     for _ in range(steps):
         state, _ = integrator(state, u)
@@ -620,6 +635,8 @@ def plot_state_gradient_through_window(
         iters=iters,
         penalize_effort=penalize_effort,
         effort_weight=effort_weight,
+        x_threshold=x_threshold,
+        u_max=u_max,
         integrator=integrator,
         save=save,
         out_dir=out_dir,
@@ -643,6 +660,8 @@ def finish_training_curve(
     out_dir,
     name_keys,
     seed=None,
+    x_threshold=DEFAULT_X_THRESHOLD,
+    u_max=DEFAULT_U_MAX,
 ):
     """Caption a per-iteration figure, then save it under `subdir` or show it."""
     values = run_values(
@@ -653,6 +672,8 @@ def finish_training_curve(
         plot_horizon=plot_horizon,
         iters=iters,
         effort_weight=effort_weight,
+        x_threshold=x_threshold,
+        u_max=u_max,
         penalize_effort=penalize_effort,
         rk4=integrator is rk4_step,
     )
@@ -1114,6 +1135,8 @@ def plot_run_summary(
     penalize_effort=True,
     save=False,
     effort_weight=DEFAULT_EFFORT_WEIGHT,
+    x_threshold=DEFAULT_X_THRESHOLD,
+    u_max=DEFAULT_U_MAX,
     integrator=rk4_step,
     traj=None,
     u=None,
@@ -1141,6 +1164,8 @@ def plot_run_summary(
         plot_horizon=plot_horizon,
         iters=iters,
         effort_weight=effort_weight,
+        x_threshold=x_threshold,
+        u_max=u_max,
         penalize_effort=penalize_effort,
         rk4=integrator is rk4_step,
     )

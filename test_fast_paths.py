@@ -21,6 +21,7 @@ from lorenz import (
     DT,
     LYAPUNOV_EXP,
     euler_step,
+    limit_control,
     lorenz_rhs,
     random_attractor_state,
     rk4_step,
@@ -467,7 +468,10 @@ def test_windows_hand_off_state_and_law():
 def test_control_is_held_over_each_window():
     """u is sampled once at each window's start and held until the next one."""
     seg = round(1.0 / (LYAPUNOV_EXP * DT))
-    run = train_receding_horizon(window=1.0, total_horizon=2.0, **RECEDING)
+    # ungated and uncapped, so every window holds its law's own sample
+    run = train_receding_horizon(
+        window=1.0, total_horizon=2.0, x_threshold=np.inf, u_max=np.inf, **RECEDING
+    )
 
     for k in range(2):
         held = (run.starts[k, 0] * run.w[k, 0]).sum(-1) + run.b[k, 0]
@@ -552,15 +556,24 @@ def test_random_start_is_reproducible():
     raise AssertionError("a given start and a seed together should have been refused")
 
 
-def _same_run(read, alone):
-    """Two single-lane RecedingRuns that must agree to the last bit."""
+def _same_run(read, alone, history_atol=0.0):
+    """Two single-lane RecedingRuns that must agree to the last bit.
+
+    `history_atol` loosens the recorded loss alone: from some starts the
+    batched time mean rounds differently from the lone one in the last place,
+    which the law, and so everything else, never sees.
+    """
     assert read.windows == alone.windows, (read.windows, alone.windows)
 
     for field in ("w", "b", "traj", "u", "history", "grad_norm", "starts"):
         mine, theirs = getattr(read, field), getattr(alone, field)
 
         assert mine.shape == theirs.shape, (field, mine.shape, theirs.shape)
-        assert np.array_equal(mine, theirs), field
+
+        if field == "history" and history_atol:
+            assert np.allclose(mine, theirs, rtol=0, atol=history_atol), field
+        else:
+            assert np.array_equal(mine, theirs), field
 
 
 def _alone(horizon, init, window=1.0):
@@ -606,6 +619,155 @@ def test_prefix_shorter_than_a_window():
     torch.manual_seed(3)
     drawn = train_receding_prefixes([2.0, 0.5], **RECEDING)[0]
     _same_run(drawn[1], _alone(0.5, (drawn[0].init_w[None], drawn[0].init_b[None])))
+
+
+# on the right lobe, well past the default threshold of 2, so the first window
+# starting here is gated off
+RIGHT_LOBE = (8.0, 8.0, 27.0)
+
+
+def test_gate_zeroes_a_lane_past_the_threshold():
+    """A start at x >= x_threshold holds u = 0 and runs uncontrolled; one below is untouched."""
+    starts = np.array([RIGHT_LOBE, (-8.0, -8.0, 27.0)])
+    w = np.array([[0.3, -0.2, 0.1], [0.3, -0.2, 0.1]])
+    b = np.array([1.5, 1.5])
+    steps = 50
+
+    traj, u = rollout_numpy_batched(starts, w, b, steps=steps, x_threshold=2.0)
+    free, _ = rollout_numpy(RIGHT_LOBE, steps=steps, u=0.0)
+    ungated, u_ungated = rollout_numpy_batched(
+        starts, w, b, steps=steps, x_threshold=np.inf
+    )
+
+    assert (u[:, 0] == 0).all()
+    assert np.array_equal(traj[:, 0], free)
+    assert np.array_equal(traj[:, 1], ungated[:, 1])
+    assert np.array_equal(u[:, 1], u_ungated[:, 1]) and (u[:, 1] != 0).all()
+
+
+def test_a_gated_window_leaves_its_law_untrained():
+    """A window starting past the threshold gets no gradient and passes its law on."""
+    seg = round(1.0 / (LYAPUNOV_EXP * DT))
+    w0, b0 = (p.detach() for p in init_policy_params(1))
+
+    run = train_receding_horizon(
+        state0=RIGHT_LOBE, window=1.0, total_horizon=2.0, init=(w0, b0), **RECEDING
+    ).lane(0)
+    rows = RECEDING["iters"]
+    free, _ = rollout_numpy(RIGHT_LOBE, steps=seg, u=0.0)
+
+    assert (run.u[:seg] == 0).all()
+    assert np.array_equal(run.traj[: seg + 1], free)
+    assert np.array_equal(run.w[0], w0.numpy()[0])
+    assert np.array_equal(run.b[0], b0.numpy()[0])
+    # no task gradient, no effort gradient, and no effort to pay
+    assert (run.grad_norm[:rows] == 0).all()
+    assert (run.history[:rows, 1] == 0).all()
+
+
+def _two_limits(horizons, name, values, state0=RIGHT_LOBE, init=None, **same):
+    """Two lanes that differ only in one limit, batched, and each alone."""
+    if init is None:
+        init = tuple(p.detach() for p in init_policy_params(2))
+
+    batched = train_receding_prefixes(
+        horizons, state0=state0, batch=2, init=init, **{name: values}, **RECEDING
+    )
+
+    for i, value in enumerate(values):
+        for run, horizon in zip(batched[i], horizons):
+            alone = train_receding_horizon(
+                state0=state0,
+                window=1.0,
+                total_horizon=horizon,
+                init=(init[0][i : i + 1], init[1][i : i + 1]),
+                **{name: value},
+                **RECEDING,
+            ).lane(0)
+
+            _same_run(run, alone, **same)
+            assert getattr(run, name) == value
+
+    return batched
+
+
+def test_thresholds_batch_per_lane():
+    """Each lane is gated by its own threshold, as if it had trained alone."""
+    batched = _two_limits([2.0], "x_threshold", [2.0, np.inf])
+
+    # and the two really did differ: only the gated lane held zero at the start
+    assert batched[0][0].u[0] == 0 and batched[1][0].u[0] != 0
+
+
+def test_remainder_branches_keep_their_threshold():
+    """A remainder window trained as a branch is gated by its own lane's threshold."""
+    _two_limits([2.0, 1.5], "x_threshold", [2.0, np.inf])
+
+
+# on the left lobe, below the default threshold, so every window starting here
+# is controlled
+LEFT_LOBE = (-8.0, -8.0, 27.0)
+
+
+def test_cap_clips_the_held_control():
+    """A law past ±u_max holds exactly ±u_max; one inside the cap is untouched."""
+    starts = np.array([LEFT_LOBE] * 3)
+    w = np.zeros((3, 3))
+    b = np.array([50.0, -50.0, 3.0])
+    steps = 50
+
+    traj, u = rollout_numpy_batched(starts, w, b, steps=steps, u_max=10.0)
+
+    assert (u[:, 0] == 10.0).all() and (u[:, 1] == -10.0).all()
+    assert (u[:, 2] == 3.0).all()
+
+    for lane, held in enumerate((10.0, -10.0, 3.0)):
+        alone, _ = rollout_numpy(LEFT_LOBE, steps=steps, u=held)
+        assert np.array_equal(traj[:, lane], alone), lane
+
+    # torch clips and gates exactly as numpy does, the limits one per lane
+    raw = np.array([50.0, -50.0, 3.0, 50.0])
+    x = np.array([-8.0, -8.0, -8.0, 8.0])
+    caps, gates = np.array([10.0, 10.0, np.inf, 10.0]), np.full(4, 2.0)
+    mine = limit_control(torch.tensor(raw), torch.tensor(x), gates, caps).numpy()
+
+    assert np.array_equal(mine, limit_control(raw, x, gates, caps))
+    assert np.array_equal(mine, [10.0, -10.0, 3.0, 0.0])
+
+
+def test_a_clipped_window_leaves_its_law_untrained():
+    """A law held at the cap gets no gradient, so the window leaves it where it was."""
+    w0 = torch.zeros(1, 3, dtype=torch.float64)
+    b0 = torch.full((1,), 50.0, dtype=torch.float64)
+
+    run = train_receding_horizon(
+        state0=LEFT_LOBE, window=1.0, total_horizon=1.0, init=(w0, b0), **RECEDING
+    ).lane(0)
+
+    assert (run.u == 10.0).all()
+    assert np.array_equal(run.w[0], w0.numpy()[0])
+    assert np.array_equal(run.b[0], b0.numpy()[0])
+    assert (run.grad_norm == 0).all()
+
+
+def test_caps_batch_per_lane():
+    """Each lane is capped by its own u_max, remainder branches included."""
+    # u = 0.1·(-8 - 8 + 27) + 1 = 2.1 at the start, over the tighter cap only
+    init = (torch.full((2, 3), 0.1, dtype=torch.float64), torch.ones(2, dtype=torch.float64))
+    # this start is one where the recorded loss is off by an ulp batched,
+    # capped or not
+    batched = _two_limits(
+        [2.0, 1.5],
+        "u_max",
+        [0.5, np.inf],
+        state0=LEFT_LOBE,
+        init=init,
+        history_atol=1e-15,
+    )
+
+    # the capped lane sits at its cap, while the uncapped one trained freely
+    assert batched[0][0].u[0] == 0.5 and batched[1][0].u[0] != 0.5
+    assert (np.abs(batched[0][0].u) <= 0.5).all()
 
 
 if __name__ == "__main__":

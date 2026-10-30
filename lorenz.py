@@ -1,8 +1,11 @@
 """The Lorenz system, its integrators, and trajectory rollouts.
 
-Knows nothing about controllers beyond the fact that a step takes some `u`:
+Knows little about controllers beyond the fact that a step takes some `u`:
 `eval_control` accepts either a constant or a callable of the state, so the
-same integrators serve an open-loop forcing and a learned feedback law.
+same integrators serve an open-loop forcing and a learned feedback law. The one
+thing it does know is `limit_control`, the cap and gate every held control
+goes through, so the scored rollout here and the trained one in training.py
+cannot disagree about how hard, or when, the controller acts.
 
 `rk4_step` is the default everywhere a rollout takes an integrator; euler is
 kept because a sweep can still ask for it (`rk4=0`) and compare the two.
@@ -10,6 +13,8 @@ kept because a sweep can still ask for it (`rk4=0`) and compare the two.
 
 import numpy as np
 import torch
+
+from params import DEFAULT_U_MAX, DEFAULT_X_THRESHOLD
 
 RAYLEIGH = 28
 PRANDTL = 10
@@ -60,6 +65,35 @@ def rk4_step(state, control, dt=DT):
     k4 = lorenz_rhs(s4, eval_control(control, s4))
 
     return state + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4), k1
+
+
+def limit_control(u, x, x_threshold=DEFAULT_X_THRESHOLD, u_max=DEFAULT_U_MAX):
+    """The control actually applied: `u` clipped to ±u_max while x < x_threshold, zero otherwise.
+
+    `x` is the state the held control was sampled at, the window's start, so a
+    window either carries its law's capped u throughout or no control at all.
+    Both are hard, in training as in evaluation, so the controller trained is
+    exactly the one scored; inf turns either off. A clipped u passes no
+    gradient back to the law, just as a gated-off one doesn't. Numpy or torch,
+    the limits a scalar or one per lane. A torch caller that captures a CUDA
+    graph hands the limits in as tensors already on the device, since
+    converting a number there is a host-to-device copy.
+    """
+    if isinstance(u, torch.Tensor):
+        x_threshold, u_max = (
+            limit
+            if isinstance(limit, torch.Tensor)
+            else torch.as_tensor(limit, dtype=u.dtype, device=u.device)
+            for limit in (x_threshold, u_max)
+        )
+
+        return torch.where(x < x_threshold, torch.clamp(u, -u_max, u_max), 0.0)
+
+    u_max = np.asarray(u_max, dtype=float)
+
+    return np.where(
+        x < np.asarray(x_threshold, dtype=float), np.clip(u, -u_max, u_max), 0.0
+    )
 
 
 def rollout_numpy(state0, steps=DEFAULT_STEPS, u=0.0, integrator=rk4_step):
@@ -118,11 +152,21 @@ def rollout_torch(state0, control, steps=DEFAULT_STEPS, integrator=rk4_step):
     return torch.stack(traj)
 
 
-def rollout_numpy_batched(state0, w, b, steps=DEFAULT_STEPS, integrator=rk4_step):
+def rollout_numpy_batched(
+    state0,
+    w,
+    b,
+    steps=DEFAULT_STEPS,
+    integrator=rk4_step,
+    x_threshold=DEFAULT_X_THRESHOLD,
+    u_max=DEFAULT_U_MAX,
+):
     """B held-control rollouts at once: traj (steps+1, B, 3), u (steps+1, B).
 
     Each lane's law is sampled once, at `state0`, and that u is held over every
     step, as over a training window; `u` is that value repeated, one per state.
+    That u is clipped to ±`u_max`, and a lane whose start has x at or past
+    `x_threshold` holds zero instead (limit_control); both scalar or per lane.
     Nothing here is differentiated -- this is the evaluation trajectory the
     figures and the success metric are read off -- so it stays in numpy, where
     a step on a (B, 3) array costs a fraction of the same step as torch ops.
@@ -130,7 +174,7 @@ def rollout_numpy_batched(state0, w, b, steps=DEFAULT_STEPS, integrator=rk4_step
     w = np.asarray(w, dtype=float)
     b = np.asarray(b, dtype=float)
     state = np.broadcast_to(np.asarray(state0, dtype=float), w.shape).copy()
-    u = (state * w).sum(-1) + b
+    u = limit_control((state * w).sum(-1) + b, state[:, 0], x_threshold, u_max)
 
     traj = np.empty((steps + 1, *w.shape))
     traj[0] = state
