@@ -6,6 +6,7 @@
     python run_control.py -loss -s             # also save a loss curve
     python run_control.py -gn -s               # and a gradient norm vs. iteration
     python run_control.py -sg -s               # ∂L/∂state through the window
+    python run_control.py -gt                  # the gradient along the trajectory
     python run_control.py -lgh 8               # loss-gradient vs. horizon
 
 The projected horizon -ph is cut into windows of -th Lyapunov times. Each
@@ -28,6 +29,7 @@ import argparse
 
 from figures import (
     plot_grad_norm_curve,
+    plot_gradient_along_trajectory,
     plot_loss_curve,
     plot_loss_gradient_vs_horizon,
     plot_run_summary,
@@ -122,6 +124,13 @@ if __name__ == "__main__":
         action="store_true",
         help="also plot the gradient w.r.t. each state in the window, across training",
     )
+    flags.add_argument(
+        "-gt",
+        "--gradient_trajectory",
+        action="store_true",
+        help="also plot the gradient along the stitched trajectory against the "
+        "state and control",
+    )
     args = parser.parse_args()
 
     integrator = euler_step if args.euler else rk4_step
@@ -190,6 +199,9 @@ if __name__ == "__main__":
             plot_state_gradient_through_window(
                 run.params_seen, starts=run.starts, **shared
             )
+
+        if args.gradient_trajectory:
+            plot_gradient_along_trajectory(run, **shared)
 
         # scored and drawn on the stitched trajectory: law k over window k
         plot_run_summary(

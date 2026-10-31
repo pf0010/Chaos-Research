@@ -29,6 +29,7 @@ same number either way. See kernels.py.
     python sweep.py -j 4                        # cap at 4 figure-drawing workers
     python sweep.py -loss                       # also save a loss curve per point
     python sweep.py -gn                         # and/or a gradient-norm curve
+    python sweep.py -gt                         # and/or the gradient along the trajectory
     python sweep.py -np                         # skip the success plot at the end
     python sweep.py -sc                         # just replot the latest sweep
     python sweep.py --device cpu                # or --fp64, or --no-graph
@@ -57,6 +58,7 @@ everything it produces into that one directory:
         attractor/                  # one png per grid point
         loss_v_iteration/           # one png per grid point, with -loss
         grad_norm_v_iteration/      # one png per grid point, with -gn
+        gradient_along_trajectory/  # one png per grid point, with -gt
 
 The success figure plots the success metric against the training window (or the
 plot horizon, when the window was held fixed);
@@ -327,7 +329,12 @@ def draw_point(job):
     import contextlib
     import io
 
-    from figures import plot_grad_norm_curve, plot_loss_curve, plot_run_summary
+    from figures import (
+        plot_grad_norm_curve,
+        plot_gradient_along_trajectory,
+        plot_loss_curve,
+        plot_run_summary,
+    )
 
     (
         values,
@@ -341,6 +348,7 @@ def draw_point(job):
         name_keys,
         loss_curve,
         grad_norm_curve,
+        gradient_run,
     ) = job
 
     import torch
@@ -369,6 +377,9 @@ def draw_point(job):
 
         if grad_norm_curve:
             plot_grad_norm_curve(grad_norm, **shared)
+
+        if gradient_run is not None:
+            plot_gradient_along_trajectory(gradient_run, **shared)
 
         plot_run_summary(params, traj=traj, u=u, **shared)
 
@@ -562,6 +573,13 @@ if __name__ == "__main__":
         help="also save a gradient-norm-vs-iteration plot for every grid point",
     )
     flags.add_argument(
+        "-gt",
+        "--gradient_trajectory",
+        action="store_true",
+        help="also save the gradient along the trajectory, against the state "
+        "and control, for every grid point",
+    )
+    flags.add_argument(
         "-npe",
         "--no_penalize_effort",
         action="store_true",
@@ -714,6 +732,9 @@ if __name__ == "__main__":
                     name_keys,
                     args.loss_curve,
                     args.grad_norm_curve,
+                    # the whole run, since the figure replays every window's
+                    # law from its start; only shipped to the worker if drawn
+                    run if args.gradient_trajectory else None,
                 )
             )
 
