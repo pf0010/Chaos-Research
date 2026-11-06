@@ -22,6 +22,9 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 DEFAULT_EFFORT_WEIGHT = 0.07
+# per window. A sliding window has about 221 of them per Lyapunov time, so this
+# spends what 600 iterations per back-to-back window used to
+DEFAULT_ITERS = 3
 
 TRUE_WORDS = {"1", "true", "on", "yes"}
 FALSE_WORDS = {"0", "false", "off", "no"}
@@ -162,16 +165,25 @@ PARAMS = (
         100.0,
         float,
         _decimal(1),
-        # a receding-horizon run to 9 Lyapunov times is the first 9 windows of
-        # the run to 10, so a sweep over it trains the longest one only
+        # a receding-horizon run to 9 Lyapunov times is the start of the run
+        # to 10, so a sweep over it trains the longest one only
         nested=True,
+    ),
+    Param(
+        "stride",
+        "st",
+        "-st",
+        "window stride (steps)",
+        1,
+        lambda v: int(float(v)),
+        lambda v: f"{int(v):d}",
     ),
     Param(
         "iters",
         "iters",
         "-i",
-        "training iterations",
-        600,
+        "training iterations per window",
+        DEFAULT_ITERS,
         lambda v: int(float(v)),
         lambda v: f"{int(v):d}",
     ),

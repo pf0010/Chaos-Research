@@ -1,6 +1,7 @@
 """Receding-horizon control of the Lorenz system, and plots of the result.
 
-    python run_control.py -th 1 -ph 10 -i 100  # 10 windows of 1 LT, random start
+    python run_control.py -th 1 -ph 10         # a 1 LT window over 10 LT, random start
+    python run_control.py -st 221 -i 600       # or 221 steps at a time: back to back
     python run_control.py -ic 0 1 1.05         # from a given start instead
     python run_control.py -seed 3              # or from a reproducible random one
     python run_control.py -loss -s             # also save a loss curve
@@ -9,10 +10,11 @@
     python run_control.py -gt                  # the gradient along the trajectory
     python run_control.py -lgh 8               # loss-gradient vs. horizon
 
-The projected horizon -ph is cut into windows of -th Lyapunov times. Each
-window trains its own feedback law for -i iterations from where the previous
-window's law left the system, starting from that law; the trajectory stitched
-from those windows is what is scored and drawn.
+A window of -th Lyapunov times slides along the projected horizon -ph, -st
+steps at a time (default 1). At each position it trains its own feedback law
+for -i iterations, from where the previous laws left the system and starting
+from the last law, and that law is applied for -st steps. The trajectory
+stitched from those steps is what is scored and drawn.
 
 The start is -ic if given, otherwise a random point on the attractor drawn from
 -seed (itself drawn and printed when not given, so any run can be repeated).
@@ -36,7 +38,13 @@ from figures import (
     plot_state_gradient_through_window,
 )
 from lorenz import euler_step, rk4_step
-from params import DEFAULT_EFFORT_WEIGHT, SWEEPABLE, resolve, resolve_start
+from params import (
+    DEFAULT_EFFORT_WEIGHT,
+    DEFAULT_ITERS,
+    SWEEPABLE,
+    resolve,
+    resolve_start,
+)
 from training import train_policy
 
 if __name__ == "__main__":
@@ -60,7 +68,21 @@ if __name__ == "__main__":
     parser.add_argument("-lr", "--learning_rate", type=float, default=0.05)
     parser.add_argument("-th", "--train_horizon", type=float, default=1)
     parser.add_argument("-ph", "--plot_horizon", type=float, default=100)
-    parser.add_argument("-i", "--iters", type=int, default=600)
+    parser.add_argument(
+        "-st",
+        "--stride",
+        type=int,
+        default=1,
+        help="steps the window moves between trainings, and the steps each law "
+        "is applied for (default: 1)",
+    )
+    parser.add_argument(
+        "-i",
+        "--iters",
+        type=int,
+        default=DEFAULT_ITERS,
+        help="training iterations per window",
+    )
     parser.add_argument(
         "-lam", "--effort_weight", type=float, default=DEFAULT_EFFORT_WEIGHT
     )
@@ -164,6 +186,7 @@ if __name__ == "__main__":
             lr=args.learning_rate,
             horizon=args.train_horizon,
             total_horizon=args.plot_horizon,
+            stride=args.stride,
             iters=args.iters,
             penalize_effort=penalize_effort,
             effort_weight=args.effort_weight,
@@ -180,6 +203,7 @@ if __name__ == "__main__":
             lr=args.learning_rate,
             train_horizon=args.train_horizon,
             plot_horizon=args.plot_horizon,
+            stride=args.stride,
             iters=args.iters,
             penalize_effort=penalize_effort,
             effort_weight=args.effort_weight,
@@ -203,7 +227,7 @@ if __name__ == "__main__":
         if args.gradient_trajectory:
             plot_gradient_along_trajectory(run, **shared)
 
-        # scored and drawn on the stitched trajectory: law k over window k
+        # scored and drawn on the stitched trajectory: each law for its stride
         plot_run_summary(
             (torch.as_tensor(run.w[-1]), torch.as_tensor(run.b[-1])),
             traj=run.traj,

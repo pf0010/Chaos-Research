@@ -28,6 +28,7 @@ from lorenz import (
 from params import (
     BY_NAME,
     DEFAULT_EFFORT_WEIGHT,
+    DEFAULT_ITERS,
     RESULT_COLUMNS,
     SWEEPABLE,
     decimal_tag,
@@ -42,7 +43,6 @@ from training import (
     final_state_sensitivity,
     init_policy_params,
     linear_policy,
-    masked_mean,
     soft_step,
     success_fraction,
     task_loss,
@@ -390,7 +390,8 @@ def plot_loss_curve(
     lr=0.05,
     train_horizon=1.0,
     plot_horizon=100,
-    iters=600,
+    stride=1,
+    iters=DEFAULT_ITERS,
     penalize_effort=True,
     effort_weight=DEFAULT_EFFORT_WEIGHT,
     integrator=rk4_step,
@@ -425,6 +426,7 @@ def plot_loss_curve(
         lr=lr,
         train_horizon=train_horizon,
         plot_horizon=plot_horizon,
+        stride=stride,
         iters=iters,
         penalize_effort=penalize_effort,
         effort_weight=effort_weight,
@@ -442,7 +444,8 @@ def plot_grad_norm_curve(
     lr=0.05,
     train_horizon=1.0,
     plot_horizon=100,
-    iters=600,
+    stride=1,
+    iters=DEFAULT_ITERS,
     penalize_effort=True,
     effort_weight=DEFAULT_EFFORT_WEIGHT,
     integrator=rk4_step,
@@ -482,6 +485,7 @@ def plot_grad_norm_curve(
         lr=lr,
         train_horizon=train_horizon,
         plot_horizon=plot_horizon,
+        stride=stride,
         iters=iters,
         penalize_effort=penalize_effort,
         effort_weight=effort_weight,
@@ -499,7 +503,8 @@ def plot_state_gradient_through_window(
     lr=0.05,
     train_horizon=1.0,
     plot_horizon=100,
-    iters=600,
+    stride=1,
+    iters=DEFAULT_ITERS,
     penalize_effort=True,
     effort_weight=DEFAULT_EFFORT_WEIGHT,
     integrator=rk4_step,
@@ -521,13 +526,11 @@ def plot_state_gradient_through_window(
 
     Under receding-horizon training each window starts somewhere new, so
     `starts` -- one per window, iters rows each -- says where each row's
-    rollout begins; without it every row begins at `state0`. A shortened
-    last window is replayed over the full window, which only this
-    diagnostic sees.
+    rollout begins; without it every row begins at `state0`.
     """
     seen = np.asarray(param_history, dtype=float)
-    stride = max(1, math.ceil(len(seen) / max_rows))
-    rows = np.arange(0, len(seen), stride)
+    every = max(1, math.ceil(len(seen) / max_rows))
+    rows = np.arange(0, len(seen), every)
 
     w = torch.as_tensor(seen[rows, :3])
     b = torch.as_tensor(seen[rows, 3])
@@ -621,6 +624,7 @@ def plot_state_gradient_through_window(
         lr=lr,
         train_horizon=train_horizon,
         plot_horizon=plot_horizon,
+        stride=stride,
         iters=iters,
         penalize_effort=penalize_effort,
         effort_weight=effort_weight,
@@ -637,16 +641,18 @@ def window_gradients(
     integrator=rk4_step,
     penalize_effort=True,
     effort_weight=DEFAULT_EFFORT_WEIGHT,
+    chunk=256,
 ):
     """∂L/∂s_t and ∂L/∂u_t at every step of a run, stitched like its trajectory.
 
-    Each window's applied law is rolled out from where that window began, as
-    one float64 lane per window, and its loss differentiated: the windows are
-    independent, so one backward pass hands every step its own window's
-    gradient. A zero nudge added to u at each step is what ∂L/∂u_t is taken
-    against, and it is held across the step's RK4 stages the way a change in
-    the control would be. The last window, if shorter, is masked to its own
-    length as training masks it.
+    Each window's applied law is rolled out from where that window began, over
+    the full window it trained on, as one float64 lane per window, and its loss
+    differentiated: the windows are independent, so one backward pass hands
+    every step its own window's gradient. A zero nudge added to u at each step
+    is what ∂L/∂u_t is taken against, and it is held across the step's RK4
+    stages the way a change in the control would be. Only the steps a window's
+    law was actually applied for are kept, so at a stride of one each step shows
+    the gradient at the very start of its window.
 
     The loss is the one each window trained on: the task term, plus λ·effort
     when the penalty is on. Receding-horizon training prices the effort
@@ -655,65 +661,82 @@ def window_gradients(
     penalty's direct pull on u_t towards zero; with the nudges at zero its
     value is effort_penalty's.
 
+    `chunk` windows go back at a time: a slide has thousands of them, and one
+    lane for each would hold every state of every window, and its graph, at once.
+
     Returns (traj, u, grad_s, grad_u), stitched over the run's steps+1 states;
     u and grad_u have no entry for the final state, which no control acts from,
     so their last entry is nan.
     """
     windows = len(run.w)
     seg = int(run.seg)
+    stride = int(run.stride)
     # not run.steps: a sweep's shorter horizons are cut from the longest run
     # and keep its step count, while their trajectory is their own
     total = len(run.traj) - 1
-    lengths = np.minimum(seg, total - seg * np.arange(windows))
+    lengths = np.minimum(stride, total - stride * np.arange(windows))
 
-    w = torch.as_tensor(run.w, dtype=torch.float64)
-    b = torch.as_tensor(run.b, dtype=torch.float64)
-    state = torch.as_tensor(run.starts, dtype=torch.float64).clone().requires_grad_()
-    nudges = torch.zeros(seg, windows, dtype=torch.float64, requires_grad=True)
-    states = [state]
+    def replay(first):
+        w = torch.as_tensor(run.w[first : first + chunk], dtype=torch.float64)
+        b = torch.as_tensor(run.b[first : first + chunk], dtype=torch.float64)
+        state = torch.as_tensor(
+            run.starts[first : first + chunk], dtype=torch.float64
+        ).clone()
+        state.requires_grad_()
+        nudges = torch.zeros(seg, len(w), dtype=torch.float64, requires_grad=True)
+        states = [state]
 
-    for t in range(seg):
-        state, _ = integrator(
-            state, lambda s, t=t: linear_policy((w, b), s) + nudges[t]
+        for t in range(seg):
+            state, _ = integrator(
+                state, lambda s, t=t: linear_policy((w, b), s) + nudges[t]
+            )
+            state.retain_grad()
+            states.append(state)
+
+        traj = torch.stack(states)
+        loss = task_loss(traj)
+
+        if penalize_effort:
+            controls = linear_policy((w, b), traj[:-1]) + nudges
+            loss = loss + effort_weight * (controls / U_REF).pow(2).mean(0)
+
+        loss.sum().backward()
+
+        traj = traj.detach()
+        u = linear_policy((w, b), traj[:-1])
+
+        return (
+            traj.numpy(),
+            u.numpy(),
+            torch.stack([s.grad for s in states]).numpy(),
+            nudges.grad.numpy(),
         )
-        state.retain_grad()
-        states.append(state)
 
-    traj = torch.stack(states)
-    ticks = torch.arange(seg + 1).unsqueeze(-1)
-    lanes = torch.as_tensor(lengths).unsqueeze(0)
-    # as in training: the task averages states 0..length, the effort the
-    # controls at 0..length-1
-    loss = task_loss(traj, mask=ticks <= lanes)
+    chunks = []
 
-    if penalize_effort:
-        controls = linear_policy((w, b), traj[:-1]) + nudges
-        effort = masked_mean((controls / U_REF).pow(2), ticks[:-1] < lanes)
-        loss = loss + effort_weight * effort
+    for first in range(0, windows, chunk):
+        per_window = replay(first)
+        kept = lengths[first : first + chunk]
+        # window k's steps 0..length-1
+        chunks.append(
+            [
+                np.concatenate([values[:n, k] for k, n in enumerate(kept)])
+                for values in per_window
+            ]
+        )
 
-    loss.sum().backward()
-
-    grad_s = torch.stack([s.grad for s in states]).numpy()
-    grad_u = nudges.grad.numpy()
-    traj = traj.detach().numpy()
-    u = linear_policy((w, b), torch.as_tensor(traj[:-1])).numpy()
-
-    # window k's steps 0..length-1, and the last window's final state to close
-    def stitch(per_window, with_end):
-        pieces = [per_window[: lengths[k], k] for k in range(windows)]
-
-        if with_end:
-            pieces.append(per_window[lengths[-1] : lengths[-1] + 1, -1])
-        else:
-            pieces.append(np.full((1, *per_window.shape[2:]), np.nan))
-
-        return np.concatenate(pieces)
+    stitched_traj, stitched_u, stitched_s, stitched_grad_u = map(
+        np.concatenate, zip(*chunks)
+    )
+    # the last window's final state closes the run
+    end = lengths[-1]
+    no_control = np.full(1, np.nan)
 
     return (
-        stitch(traj, True),
-        stitch(u, False),
-        stitch(grad_s, True),
-        stitch(grad_u, False),
+        np.concatenate((stitched_traj, per_window[0][end : end + 1, -1])),
+        np.concatenate((stitched_u, no_control)),
+        np.concatenate((stitched_s, per_window[2][end : end + 1, -1])),
+        np.concatenate((stitched_grad_u, no_control)),
     )
 
 
@@ -723,7 +746,8 @@ def plot_gradient_along_trajectory(
     lr=0.05,
     train_horizon=1.0,
     plot_horizon=100,
-    iters=600,
+    stride=1,
+    iters=DEFAULT_ITERS,
     penalize_effort=True,
     effort_weight=DEFAULT_EFFORT_WEIGHT,
     integrator=rk4_step,
@@ -735,18 +759,22 @@ def plot_gradient_along_trajectory(
     """What the loss gradient asked for along the run, against what the system did.
 
     Every panel shares the trajectory's time axis, so an instant can be read
-    straight down: x and its success, the applied u beside −∂L/∂u (the way more
-    push would lower the loss), how well the motion ds/dt lines up with
-    −∂L/∂s (the way the state would have to move to lower it), and how large
-    that gradient is. The gradient is each window's own, taken under the law
-    that was applied over it; see window_gradients.
+    straight down: x and its success, the applied u, −∂L/∂u (the way more push
+    would lower the loss), how well the motion ds/dt lines up with −∂L/∂s (the
+    way the state would have to move to lower it), and how large that gradient
+    is. The gradient is each window's own, taken under the law that was applied
+    over it; see window_gradients.
     """
     traj, u, grad_s, grad_u = window_gradients(
         run, integrator, penalize_effort, effort_weight
     )
     times = np.arange(len(traj)) * DT * LYAPUNOV_EXP
     seg = int(run.seg)
-    boundaries = np.arange(1, len(run.w)) * seg * DT * LYAPUNOV_EXP
+    stride = int(run.stride)
+    # one line per window reads at a window's stride, and is solid at a step's
+    boundaries = (
+        np.arange(1, len(run.w)) * stride * DT * LYAPUNOV_EXP if stride >= seg else []
+    )
 
     deviation = np.nanmax(np.abs(traj - np.asarray(run.traj, dtype=float)))
 
@@ -762,7 +790,7 @@ def plot_gradient_along_trajectory(
     u_agrees = np.sign(u[:-1]) == np.sign(-grad_u[:-1])
 
     # per-window means, drawn as steps over each window
-    window_of = np.arange(len(cos)) // seg
+    window_of = np.arange(len(cos)) // stride
     cos_mean = np.bincount(window_of, cos) / np.bincount(window_of)
     x_mean = np.bincount(window_of, x_agrees) / np.bincount(window_of)
 
@@ -770,12 +798,12 @@ def plot_gradient_along_trajectory(
     show_motion_panel = False
 
     fig, axes = plt.subplots(
-        4 if show_motion_panel else 3,
+        5 if show_motion_panel else 4,
         1,
         sharex=True,
-        figsize=(14, 12 if show_motion_panel else 9),
+        figsize=(14, 15 if show_motion_panel else 12),
     )
-    ax_x, ax_u, *ax_motion, ax_norm = axes
+    ax_x, ax_u, ax_ask, *ax_motion, ax_norm = axes
 
     for ax in axes:
         for t in boundaries:
@@ -797,29 +825,30 @@ def plot_gradient_along_trajectory(
     ax_x.set_title(f"State (shaded: x > 0, {success_fraction(traj):.3f} of the time)")
 
     ax_u.axhline(0, color="black", linestyle="--", linewidth=1)
-    (applied,) = ax_u.plot(times, u, color="crimson", linewidth=0.6, label="u applied")
-    ax_u.set_ylabel("u", color="crimson")
-    ax_ask = ax_u.twinx()
-    (asked,) = ax_ask.plot(
-        times, -grad_u, color="tab:blue", linewidth=0.6, label="−∂L/∂u"
-    )
+    ax_u.plot(times, u, color="crimson", linewidth=0.6)
+    ax_u.set_ylabel("u")
+    ax_u.set_title("Control applied")
+
+    ax_ask.axhline(0, color="black", linestyle="--", linewidth=1)
+    ax_ask.plot(times, -grad_u, color="tab:blue", linewidth=0.6)
     # spans orders of magnitude within a window, and changes sign
     scale = np.nanmax(np.abs(grad_u))
     ax_ask.set_yscale("symlog", linthresh=max(scale * 1e-4, 1e-300))
-    ax_ask.set_ylabel("−∂L/∂u_t", color="tab:blue")
-    ax_u.set_title(
-        f"Control vs. what the gradient asks for (same sign {u_agrees.mean():.3f} "
-        "of the time)"
+    ax_ask.set_ylabel("−∂L/∂u_t")
+    ax_ask.set_title(
+        f"What the gradient asks for (same sign as u {u_agrees.mean():.3f} of the time)"
     )
-    ax_u.legend(handles=[applied, asked], loc="upper right")
 
     if show_motion_panel:
         (ax_cos,) = ax_motion
         ax_cos.axhline(0, color="black", linestyle="--", linewidth=1)
         ax_cos.plot(times[:-1], cos, color="gray", linewidth=0.4, label="cos θ_t")
-        # the last window may be a short one, so its step ends where the run does
+        # the last law may be applied for less than a stride, so its step ends
+        # where the run does
         window_times = (
-            np.minimum(np.arange(len(cos_mean) + 1) * seg, len(cos)) * DT * LYAPUNOV_EXP
+            np.minimum(np.arange(len(cos_mean) + 1) * stride, len(cos))
+            * DT
+            * LYAPUNOV_EXP
         )
         ax_cos.stairs(
             cos_mean, window_times, color="black", linewidth=1.2, label="window mean"
@@ -861,6 +890,7 @@ def plot_gradient_along_trajectory(
         lr=lr,
         train_horizon=train_horizon,
         plot_horizon=plot_horizon,
+        stride=stride,
         iters=iters,
         penalize_effort=penalize_effort,
         effort_weight=effort_weight,
@@ -892,6 +922,7 @@ def finish_training_curve(
     name_keys,
     seed=None,
     extra=None,
+    stride=1,
 ):
     """Caption a per-iteration figure, then save it under `subdir` or show it.
 
@@ -904,6 +935,7 @@ def finish_training_curve(
         learning_rate=lr,
         train_horizon=train_horizon,
         plot_horizon=plot_horizon,
+        stride=stride,
         iters=iters,
         effort_weight=effort_weight,
         penalize_effort=penalize_effort,
@@ -1363,7 +1395,8 @@ def plot_run_summary(
     lr=0.05,
     train_horizon=1.0,
     plot_horizon=25,
-    iters=600,
+    stride=1,
+    iters=DEFAULT_ITERS,
     penalize_effort=True,
     save=False,
     effort_weight=DEFAULT_EFFORT_WEIGHT,
@@ -1392,6 +1425,7 @@ def plot_run_summary(
         learning_rate=lr,
         train_horizon=train_horizon,
         plot_horizon=plot_horizon,
+        stride=stride,
         iters=iters,
         effort_weight=effort_weight,
         penalize_effort=penalize_effort,

@@ -30,7 +30,9 @@ from lorenz import (
 from params import resolve_start
 from training import (
     BatchedAdam,
+    WindowTrainer,
     effort_moments,
+    horizon_steps,
     init_policy_params,
     linear_policy,
     train_policy_batched,
@@ -93,7 +95,6 @@ def test_batched_adam_matches_torch():
     lr = torch.full((n,), 0.05, dtype=torch.float64)
     torch_adam = torch.optim.Adam(reference, lr=0.05)
     batched = BatchedAdam(mine, [lr.unsqueeze(-1), lr])
-    step = torch.zeros(1, dtype=torch.long)
 
     for _ in range(200):
         grads = [
@@ -106,8 +107,7 @@ def test_batched_adam_matches_torch():
                 p.grad = g.clone()
 
         torch_adam.step()
-        batched.step(step + 1)
-        step.add_(1)
+        batched.step()
 
     for ref, got in zip(reference, mine):
         assert (ref - got).abs().max() < 1e-14, (ref - got).abs().max()
@@ -117,15 +117,45 @@ def test_batched_adam_learning_rates_are_independent():
     lrs = torch.tensor([0.01, 0.02, 0.05, 0.1, 0.2], dtype=torch.float64)
     p = [torch.zeros(5, 3, dtype=torch.float64, requires_grad=True)]
     opt = BatchedAdam(p, [lrs.unsqueeze(-1)])
-    step = torch.zeros(1, dtype=torch.long)
 
     # a constant unit gradient makes Adam's step exactly the learning rate
     for _ in range(10):
         p[0].grad = torch.ones(5, 3, dtype=torch.float64)
-        opt.step(step + 1)
-        step.add_(1)
+        opt.step()
 
     assert torch.allclose(p[0][:, 0], -10 * lrs, atol=1e-6)
+
+
+def test_batched_adam_resets_lanes_independently():
+    """A lane reset mid-run must restart alone, as if it had just been created."""
+    p = [torch.zeros(4, 3, dtype=torch.float64, requires_grad=True)]
+    opt = BatchedAdam(p, [torch.full((4, 1), 0.05, dtype=torch.float64)])
+    fresh = [torch.zeros(4, 3, dtype=torch.float64, requires_grad=True)]
+    fresh_opt = BatchedAdam(fresh, [torch.full((4, 1), 0.05, dtype=torch.float64)])
+    grads = [torch.randn(4, 3, dtype=torch.float64) for _ in range(8)]
+
+    for grad in grads[:5]:
+        p[0].grad = grad.clone()
+        opt.step()
+
+    kept = p[0].detach().clone()
+    opt.reset(torch.tensor([True, False, True, False]))
+
+    assert opt.count.tolist() == [0, 5, 0, 5]
+
+    with torch.no_grad():
+        p[0].copy_(fresh[0])
+
+    for grad in grads[5:]:
+        p[0].grad = grad.clone()
+        opt.step()
+
+        fresh[0].grad = grad.clone()
+        fresh_opt.step()
+
+    assert torch.equal(p[0][[0, 2]], fresh[0][[0, 2]])
+    assert not torch.equal(p[0][[1, 3]], fresh[0][[1, 3]])
+    assert kept.abs().sum() > 0
 
 
 def test_numpy_moments_match_the_scalar_loop():
@@ -420,6 +450,9 @@ def test_chaos_dominates_precision():
         print(f"  fp32 costs {precision:.1%}; a 1e-12 nudge costs {chaos:.1%}")
 
 
+# steps in a window of one Lyapunov time, the window most of these run
+ONE_LT = round(1.0 / (LYAPUNOV_EXP * DT))
+
 # a batching or hand-off bug shows from the first step, so a few iterations
 # per window are as sharp a check as many
 RECEDING = dict(
@@ -439,7 +472,12 @@ def test_one_window_is_a_plain_run():
     w0, b0 = (p.detach() for p in init_policy_params(1))
 
     run = train_receding_horizon(
-        state0=start, window=1.0, total_horizon=1.0, init=(w0, b0), **RECEDING
+        state0=start,
+        window=1.0,
+        total_horizon=1.0,
+        stride=ONE_LT,
+        init=(w0, b0),
+        **RECEDING,
     )
     w, b, history, _ = train_policy_batched(
         state0=start, horizon=1.0, effort_horizon=None, init=(w0, b0), **RECEDING
@@ -464,7 +502,12 @@ def test_windows_hand_off_state_and_law():
     seg = round(1.0 / (LYAPUNOV_EXP * DT))
 
     run = train_receding_horizon(
-        state0=start, window=1.0, total_horizon=2.0, init=(w0, b0), **RECEDING
+        state0=start,
+        window=1.0,
+        total_horizon=2.0,
+        stride=ONE_LT,
+        init=(w0, b0),
+        **RECEDING,
     )
 
     assert run.windows.tolist() == [2]
@@ -490,11 +533,19 @@ def test_windows_hand_off_state_and_law():
     assert np.array_equal(run.u[seg:], u2)
 
 
-def test_a_remainder_window_is_shorter():
-    """A horizon the window doesn't divide ends on a short window, not an overshoot."""
-    run = train_receding_horizon(window=1.0, total_horizon=2.5, **{**RECEDING, "iters": 2})
-
-    seg = round(1.0 / (LYAPUNOV_EXP * DT))
+def test_a_remainder_trains_in_full_and_is_applied_short():
+    """A stride the horizon doesn't divide leaves a last law applied for what's left."""
+    start = (0.0, 1.0, 1.05)
+    w0, b0 = (p.detach() for p in init_policy_params(1))
+    seg = ONE_LT
+    run = train_receding_horizon(
+        state0=start,
+        window=1.0,
+        total_horizon=2.5,
+        stride=seg,
+        init=(w0, b0),
+        **{**RECEDING, "iters": 2},
+    )
 
     assert run.windows.tolist() == [3]
     # two and a half windows, counted in windows rather than in raw steps
@@ -502,29 +553,46 @@ def test_a_remainder_window_is_shorter():
     assert run.steps.tolist() == [round(2.5 * seg)]
     assert np.isfinite(run.traj).all() and np.isfinite(run.u).all()
 
+    # the last window looks a whole window ahead, past the end of the run
+    w, b, _, _ = train_policy_batched(
+        state0=run.starts[2],
+        horizon=1.0,
+        effort_horizon=None,
+        init=(run.w[1], run.b[1]),
+        **{**RECEDING, "iters": 2},
+    )
+
+    assert np.array_equal(run.w[2], w.numpy())
+    assert np.array_equal(run.b[2], b.numpy())
+
+    tail = round(2.5 * seg) - 2 * seg
+    piece, _ = rollout_numpy_batched(run.starts[2], run.w[2], run.b[2], steps=tail)
+
+    assert np.array_equal(run.traj[2 * seg :], piece)
+
 
 def test_finished_lanes_stay_frozen():
     """Lanes with different windows batched together must each equal their solo run.
 
-    The longer-window lane runs out of windows first and sits out the rest at a
-    learning rate of zero, so its law, its trajectory and its records all have
-    to come back as if it had trained alone.
+    A horizon is counted in windows, so these two count 1 Lyapunov time as 221
+    and 220 steps, and the shorter lane runs out of windows first. It sits out
+    the rest at a learning rate of zero, so its law, its trajectory and its
+    records all have to come back as if it had trained alone. Its stride is a
+    whole window and the other lane's isn't, so this also has one lane resetting
+    Adam beside one carrying it.
     """
-    windows = [1.0, 2.0]
+    windows = [0.33, 0.1]
     w0, b0 = (p.detach() for p in init_policy_params(2))
+    common = dict(total_horizon=1.0, stride=22, **{**RECEDING, "iters": 3})
 
-    run = train_receding_horizon(
-        batch=2, window=windows, total_horizon=2.0, init=(w0, b0), **RECEDING
-    )
+    run = train_receding_horizon(batch=2, window=windows, init=(w0, b0), **common)
 
-    assert run.windows.tolist() == [2, 1]
+    assert run.steps.tolist() == [221, 220]
+    assert run.windows.tolist() == [11, 10]
 
     for i, window in enumerate(windows):
         one = train_receding_horizon(
-            window=window,
-            total_horizon=2.0,
-            init=(w0[i : i + 1], b0[i : i + 1]),
-            **RECEDING,
+            window=window, init=(w0[i : i + 1], b0[i : i + 1]), **common
         ).lane(0)
         mine = run.lane(i)
 
@@ -533,7 +601,7 @@ def test_finished_lanes_stay_frozen():
         assert mine.history.shape == one.history.shape
 
     # padding past a lane's last window repeats its last law exactly
-    assert np.array_equal(run.w[1, 1], run.w[0, 1])
+    assert np.array_equal(run.w[10, 1], run.w[9, 1])
 
 
 def test_random_start_is_reproducible():
@@ -574,16 +642,18 @@ def _same_run(read, alone):
         assert np.array_equal(mine, theirs), field
 
 
-def _alone(horizon, init, window=1.0):
+def _alone(horizon, init, window=1.0, stride=ONE_LT):
     return train_receding_horizon(
-        window=window, total_horizon=horizon, init=init, **RECEDING
+        window=window, total_horizon=horizon, stride=stride, init=init, **RECEDING
     ).lane(0)
 
 
 def test_prefix_equals_a_shorter_run():
     """A horizon at a window boundary is read off the longer run exactly."""
     init = tuple(p.detach() for p in init_policy_params(1))
-    runs = train_receding_prefixes([3.0, 2.0, 1.0], init=init, **RECEDING)[0]
+    runs = train_receding_prefixes(
+        [3.0, 2.0, 1.0], stride=ONE_LT, init=init, **RECEDING
+    )[0]
 
     _same_run(runs[0], _alone(3.0, init))
     _same_run(runs[1], _alone(2.0, init))
@@ -595,28 +665,187 @@ def test_prefix_equals_a_shorter_run():
     assert runs[1].windows == 2 and len(runs[1].traj) == 2 * seg + 1
 
 
-def test_remainder_branch_equals_a_shorter_run():
-    """A horizon part-way through a window ends on its own shorter window."""
+def test_horizon_inside_a_window_equals_a_shorter_run():
+    """A horizon part-way through a window is a plain cut: no window changes."""
     init = tuple(p.detach() for p in init_policy_params(1))
-    runs = train_receding_prefixes([3.0, 2.5], init=init, **RECEDING)[0]
+    runs = train_receding_prefixes([3.0, 2.5], stride=ONE_LT, init=init, **RECEDING)[0]
 
     _same_run(runs[1], _alone(2.5, init))
-    # and the branch leaves the long run it hangs off untouched
     _same_run(runs[0], _alone(3.0, init))
 
 
 def test_prefix_shorter_than_a_window():
-    """A horizon inside the first window is one short window from the first law."""
+    """A horizon inside the first window is that much of the first law."""
     init = tuple(p.detach() for p in init_policy_params(1))
-    runs = train_receding_prefixes([2.0, 0.5], init=init, **RECEDING)[0]
+    runs = train_receding_prefixes([2.0, 0.5], stride=ONE_LT, init=init, **RECEDING)[0]
 
     _same_run(runs[1], _alone(0.5, init))
 
     # the law it starts from is the one the long run recorded, whether or not
     # the caller handed one in
     torch.manual_seed(3)
-    drawn = train_receding_prefixes([2.0, 0.5], **RECEDING)[0]
+    drawn = train_receding_prefixes([2.0, 0.5], stride=ONE_LT, **RECEDING)[0]
     _same_run(drawn[1], _alone(0.5, (drawn[0].init_w[None], drawn[0].init_b[None])))
+
+
+# a window of 11 steps sliding one step at a time: long enough to overlap, short
+# enough that a slide over a few of them stays quick on the cpu
+SLIDE = dict(window=0.05, stride=1, total_horizon=0.1, **{**RECEDING, "iters": 3})
+SLIDE_SEG = round(0.05 / (LYAPUNOV_EXP * DT))
+
+
+def test_slide_is_a_law_per_step():
+    """Stride 1: every step has its own window, and each law acts for one step."""
+    start = (0.0, 1.0, 1.05)
+    w0, b0 = (p.detach() for p in init_policy_params(1))
+    run = train_receding_horizon(state0=start, init=(w0, b0), **SLIDE).lane(0)
+    total = horizon_steps(0.1, 0.05, SLIDE_SEG)
+
+    assert run.windows == total == 22
+    assert run.w.shape == (total, 3)
+    assert len(run.traj) == total + 1
+    assert run.history.shape == (total * SLIDE["iters"], 3)
+
+    for k in range(total):
+        assert np.array_equal(run.starts[k], run.traj[k])
+
+        piece, controls = rollout_numpy_batched(
+            run.traj[k : k + 1], run.w[k : k + 1], run.b[k : k + 1], steps=1
+        )
+
+        assert np.array_equal(piece[1, 0], run.traj[k + 1]), k
+        assert run.u[k] == controls[0, 0], k
+
+
+def test_slide_trains_each_window_in_full_past_the_horizon():
+    """The last window keeps its full length rather than shrinking at the end."""
+    w0, b0 = (p.detach() for p in init_policy_params(1))
+    run = train_receding_horizon(init=(w0, b0), **SLIDE).lane(0)
+
+    # a window's first recorded loss is taken before any update, so it is fixed
+    # by that window's start, the law before it, and how far the window reaches
+    def first_loss(steps):
+        _, _, history, _ = train_policy_batched(
+            state0=run.starts[-1],
+            horizon=steps * LYAPUNOV_EXP * DT,
+            effort_horizon=None,
+            init=(run.w[-2:-1], run.b[-2:-1]),
+            **{**RECEDING, "iters": 1},
+        )
+
+        return history[0, 0]
+
+    recorded = run.history[-SLIDE["iters"]]
+
+    assert np.array_equal(recorded, first_loss(SLIDE_SEG))
+    assert not np.array_equal(recorded, first_loss(1))
+
+
+def test_adam_carries_across_overlapping_windows():
+    """Training in two calls with Adam kept must equal one uninterrupted training."""
+    start = np.array([[0.0, 1.0, 1.05]])
+    w0, b0 = (p.detach() for p in init_policy_params(1))
+    horizon = SLIDE_SEG * LYAPUNOV_EXP * DT
+    kind = {k: RECEDING[k] for k in ("effort_weight", "device", "dtype", "use_graph")}
+
+    whole = WindowTrainer(horizon=horizon, iters=10, **kind)
+    w_whole, b_whole, *_ = whole.train(start, (w0, b0), 0.05)
+
+    pieces = WindowTrainer(horizon=horizon, iters=5, **kind)
+    w, b, *_ = pieces.train(start, (w0, b0), 0.05, reset=np.array([True]))
+    w, b, *_ = pieces.train(start, (w, b), 0.05, reset=np.array([False]))
+
+    assert torch.equal(w, w_whole) and torch.equal(b, b_whole)
+
+    # and a reset really is a different optimizer path
+    pieces = WindowTrainer(horizon=horizon, iters=5, **kind)
+    w, b, *_ = pieces.train(start, (w0, b0), 0.05)
+    w, b, *_ = pieces.train(start, (w, b), 0.05)
+
+    assert not torch.equal(w, w_whole)
+
+
+def test_trainer_records_are_the_callers_to_keep():
+    """A later window must not write over what an earlier one handed back."""
+    start = np.array([[0.0, 1.0, 1.05]])
+    w0, b0 = (p.detach() for p in init_policy_params(1))
+    horizon = SLIDE_SEG * LYAPUNOV_EXP * DT
+    kind = {k: RECEDING[k] for k in ("effort_weight", "device", "dtype", "use_graph")}
+    trainer = WindowTrainer(horizon=horizon, iters=5, record_params=True, **kind)
+
+    first = trainer.train(start, (w0, b0), 0.05)
+    kept = [np.asarray(values).copy() for values in first]
+
+    trainer.train(start + 1, first[:2], 0.05, reset=np.array([False]))
+
+    for was, now in zip(kept, first):
+        assert np.array_equal(was, np.asarray(now))
+
+
+def test_slide_prefixes_equal_shorter_runs():
+    """At stride 1 every shorter horizon reads off the long run to the last bit."""
+    init = tuple(p.detach() for p in init_policy_params(1))
+    common = {k: v for k, v in SLIDE.items() if k != "total_horizon"}
+    runs = train_receding_prefixes([0.1, 0.075, 0.02], init=init, **common)[0]
+
+    for run, horizon in zip(runs, (0.1, 0.075, 0.02)):
+        alone = train_receding_horizon(
+            total_horizon=horizon, init=init, **common
+        ).lane(0)
+
+        _same_run(run, alone)
+
+
+def test_stride_cannot_outrun_the_window():
+    """A law is never applied past what it was trained on."""
+    for stride in (0, ONE_LT + 1):
+        try:
+            train_receding_horizon(
+                window=1.0, total_horizon=1.0, stride=stride, **RECEDING
+            )
+        except ValueError:
+            continue
+
+        raise AssertionError(f"stride {stride} should have been refused")
+
+
+def test_graph_reuse_across_windows_matches_eager():
+    """The captured graph has to see every window's new start, law and rate.
+
+    All three are copied in place between replays. One missed copy would leave
+    the graph training the first window over and over, which still runs. The
+    second lane runs out of windows first, which is the only thing that moves
+    the learning rate, and has a stride of a whole window, so it resets while
+    the first lane carries.
+    """
+    if not CUDA:
+        print("  (skipped: no CUDA device)")
+        return
+
+    w0, b0 = (p.detach() for p in init_policy_params(2))
+    common = dict(
+        batch=2,
+        state0=[[0.0, 1.0, 1.05], [1.0, -1.0, 20.0]],
+        window=[0.33, 0.1],
+        total_horizon=0.5,
+        stride=22,
+        iters=3,
+        learning_rate=[0.05, 0.02],
+        effort_weight=[0.07, 0.2],
+        device="cuda",
+        dtype=torch.float64,
+        init=(w0, b0),
+    )
+
+    graphed = train_receding_horizon(use_graph=True, **common)
+    eager = train_receding_horizon(use_graph=False, **common)
+
+    assert graphed.windows.tolist() == [6, 5]
+    assert np.abs(graphed.w - eager.w).max() < 1e-10, np.abs(graphed.w - eager.w).max()
+    assert np.abs(graphed.b - eager.b).max() < 1e-10
+    # nan past the short lane's own horizon, in both
+    assert np.nanmax(np.abs(graphed.traj - eager.traj)) < 1e-10
+    assert np.array_equal(np.isnan(graphed.traj), np.isnan(eager.traj))
 
 
 if __name__ == "__main__":

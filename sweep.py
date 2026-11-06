@@ -1,20 +1,19 @@
 """Sweep receding-horizon control over a grid of any run parameters.
 
 Every grid point is a receding-horizon run (training.train_receding_horizon):
-the projected horizon is cut into windows of the training window's length,
-each window trains its own law from where the last one left the system, and
-the stitched trajectory is what is scored and drawn.
+a training window slides along the projected horizon, each position trains its
+own law from where the last one left the system, and the stitched trajectory is
+what is scored and drawn.
 
-A run to a shorter plot horizon is the first windows of a run to a longer one,
-so the plot horizon costs neither a group nor a lane: each lane is trained once,
-to the longest horizon swept, and every other horizon is read off it (a horizon
-that ends part-way through a window gets that last window trained on its own).
-`-sw ph=1:10:1` costs 10 windows, not 1+2+...+10.
+A run to a shorter plot horizon is the start of a run to a longer one, so the
+plot horizon costs neither a group nor a lane: each lane is trained once, to the
+longest horizon swept, and every other horizon is read off it. `-sw ph=1:10:1`
+costs a run to 10, not 1+2+...+10.
 
 The grid is trained in batches, not one point at a time: λ and the learning
 rate ride along a leading batch axis, so a whole row of the grid costs one set
 of kernels rather than one set each. Everything that would change the shape of
-the computation -- the window length, the integrator, the iteration count --
+the computation -- the stride, the integrator, the iteration count --
 splits the grid into groups that are trained one after another (params.py marks
 which is which). On a GPU the batch is close to free: a group of 11 costs about
 what a group of 1 does, because the cost is kernel launches and there are the
@@ -25,6 +24,7 @@ same number either way. See kernels.py.
     python sweep.py -sw lam=0.05:0.15:0.01 -sw th=1:2:0.25 -sw rk4=0,1
     python sweep.py -sw ph=1:10:1 -sw th=1      # success vs. horizon, one run long
     python sweep.py -sw seed=0:31:1             # an ensemble of random starts
+    python sweep.py -sw st=1,221 -sw th=1       # sliding vs. back-to-back windows
     python sweep.py -sw "ic=0:1:0.25|1|1.05"    # or of given ones
     python sweep.py -j 4                        # cap at 4 figure-drawing workers
     python sweep.py -loss                       # also save a loss curve per point
@@ -195,6 +195,7 @@ def build_base(args, axes):
             ("seed", args.seed),
             ("learning_rate", args.learning_rate),
             ("plot_horizon", args.plot_horizon),
+            ("stride", args.stride),
             ("iters", args.iters),
         )
         if value is not None
@@ -300,6 +301,7 @@ def train_group(group, device, dtype, use_graph):
         state0=[values["initial_condition"] for values in heads],
         batch=len(lanes),
         window=[values["train_horizon"] for values in heads],
+        stride=settings["stride"],
         iters=settings["iters"],
         learning_rate=[values["learning_rate"] for values in heads],
         effort_weight=[values["effort_weight"] for values in heads],
@@ -360,6 +362,7 @@ def draw_point(job):
         lr=values["learning_rate"],
         train_horizon=values["train_horizon"],
         plot_horizon=values["plot_horizon"],
+        stride=values["stride"],
         iters=values["iters"],
         penalize_effort=values["penalize_effort"],
         effort_weight=values["effort_weight"],
@@ -530,6 +533,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("-lr", "--learning_rate", type=float, default=None)
     parser.add_argument("-ph", "--plot_horizon", type=float, default=None)
+    parser.add_argument("-st", "--stride", type=int, default=None)
     parser.add_argument("-i", "--iters", type=int, default=None)
 
     parser.add_argument(
