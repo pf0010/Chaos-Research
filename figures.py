@@ -684,11 +684,15 @@ def window_gradients(
         ).clone()
         state.requires_grad_()
         nudges = torch.zeros(seg, len(w), dtype=torch.float64, requires_grad=True)
+        # split once rather than indexed per stage: each nudges[t] backpropagates
+        # by filling and adding into a full (seg, B) zero gradient, which over
+        # 4 stages x seg steps was nearly all of this figure's time
+        per_step = nudges.unbind(0)
         states = [state]
 
         for t in range(seg):
             state, _ = integrator(
-                state, lambda s, t=t: linear_policy((w, b), s) + nudges[t]
+                state, lambda s, t=t: linear_policy((w, b), s) + per_step[t]
             )
             state.retain_grad()
             states.append(state)
