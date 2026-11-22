@@ -55,6 +55,8 @@ everything it produces into that one directory:
         success.csv                 # one row per grid point, every parameter
         success_v_th.png            # unless -np (success_v_ph.png if th is fixed)
         action_v_th.png             # the same figure for each run's mean |u|
+        success_by_start.png        # a bar per start, when the start varies
+        occupancy_histogram.png     # binned, against the same starts uncontrolled
         attractor/                  # one png per grid point
         loss_v_iteration/           # one png per grid point, with -loss
         grad_norm_v_iteration/      # one png per grid point, with -gn
@@ -153,10 +155,28 @@ def latest_sweep_csv():
 
 def plot_csv(path, save):
     # imported here so a plain sweep doesn't pay for torch and matplotlib
-    from figures import plot_action, plot_success
+    from figures import (
+        ENSEMBLE_KEYS,
+        X_KEYS,
+        plot_action,
+        plot_occupancy_histogram,
+        plot_success,
+        plot_success_by_start,
+        read_sweep_csv,
+    )
 
-    plot_success(path, save=save)
-    plot_action(path, save=save)
+    _, _, varying = read_sweep_csv(path)
+    by_start = any(name in varying for name in ENSEMBLE_KEYS)
+
+    if by_start:
+        plot_success_by_start(path, save=save)
+        plot_occupancy_histogram(path, save=save)
+
+    # an ensemble with the window and horizon held fixed has no x axis for
+    # these two, and the per-start bars above are already its figure
+    if not by_start or any(name in varying for name in X_KEYS):
+        plot_success(path, save=save)
+        plot_action(path, save=save)
 
 
 def git_sha():

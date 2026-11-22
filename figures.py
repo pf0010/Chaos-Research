@@ -20,9 +20,11 @@ from mpl_toolkits.mplot3d.art3d import Line3DCollection
 from lorenz import (
     DT,
     LYAPUNOV_EXP,
+    euler_step,
     lorenz_rhs,
     rk4_step,
     rollout_numpy,
+    rollout_numpy_batched,
     rollout_torch,
 )
 from params import (
@@ -1080,6 +1082,319 @@ def plot_action(path, save=False):
         best_label="lowest mean |u|",
         lowest_best=True,
     )
+
+
+# a start counts as a success when the run spends at least this much of its
+# time on the x > 0 lobe -- just over the half an uncontrolled run would get
+SUCCESS_THRESHOLD = 0.51
+SUCCEEDED_COLOR = "#2a9d8f"
+FAILED_COLOR = "#e76f51"
+
+
+def _start_groups(path):
+    """A sweep's runs split into one group per setting, each group its starts.
+
+    Everything the sweep varied except the start picks the group, since starts
+    from different settings shown together would read as one experiment.
+    Returns (organizing, [(values, rows)], base caption), the rows in csv order.
+    """
+    rows, columns, varying = read_sweep_csv(path)
+    organizing = [name for name in varying if name not in ENSEMBLE_KEYS]
+
+    groups = {}
+
+    for row in rows:
+        key = tuple(_parsed(name, row) for name in organizing)
+        groups.setdefault(key, []).append(row)
+
+    # an empty cell is a value the run never had -- a given start's seed
+    caption = {}
+    for name in columns:
+        value = BY_NAME[name].parse(rows[0][name])
+        if name not in varying and value is not None:
+            caption[name] = BY_NAME[name].show(value)
+    caption["dt"] = DT
+
+    return (
+        organizing,
+        [(dict(zip(organizing, key)), group) for key, group in groups.items()],
+        caption,
+    )
+
+
+def _parsed(name, row):
+    return BY_NAME[name].parse(row.get(name, ""))
+
+
+def _setting_label(values):
+    return "   ".join(
+        f"{BY_NAME[name].key}={BY_NAME[name].show(value)}"
+        for name, value in values.items()
+    )
+
+
+def _threshold_handles(threshold):
+    percent = f"{threshold * 100:g}%"
+
+    return [
+        Patch(facecolor=SUCCEEDED_COLOR, label=f"≥{percent} of time x > 0"),
+        Patch(facecolor=FAILED_COLOR, label=f"<{percent} of time x > 0"),
+        Line2D(
+            [], [], color="black", linestyle="--", label=f"success threshold: {percent}"
+        ),
+    ]
+
+
+def _finish_start_figures(path, file_stem, organizing, figures, save):
+    """Caption, save and report the figures a per-start plot drew.
+
+    `figures` is [(fig, values, caption)]. One figure saves as <file_stem>.png
+    beside the csv; more go in a <file_stem>/ directory, named the way the
+    attractor plots are.
+    """
+    out_dir = os.path.dirname(path) or "."
+    outputs = []
+
+    for fig, values, caption in figures:
+        text = wrap_caption(settings_caption(**caption), fig.get_figwidth())
+        below = 0.14 * text.count("\n")
+        fig.tight_layout(rect=(0, (0.30 + below) / fig.get_figheight(), 1, 1))
+        add_caption(fig, text, y=0.06 / fig.get_figheight())
+
+        if save:
+            if len(figures) > 1:
+                out = os.path.join(
+                    out_dir, file_stem, stem(values, organizing) + ".png"
+                )
+            else:
+                out = os.path.join(out_dir, f"{file_stem}.png")
+
+            os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+            fig.savefig(out, dpi=150, bbox_inches="tight")
+            plt.close(fig)
+            outputs.append(out)
+
+    if not save:
+        plt.show()
+    elif len(outputs) == 1:
+        print(f"Saved to {outputs[0]}")
+    else:
+        print(f"Saved {len(outputs)} figures to {os.path.dirname(outputs[0])}/")
+
+
+def plot_success_by_start(path, save=False, threshold=SUCCESS_THRESHOLD):
+    """One bar per start: the success each start reached, against a pass line.
+
+    The ensemble figures collapse the starts into a median and bands; this one
+    keeps them apart, so a start that failed can be found and rerun. Each bar
+    is labelled with its seed (when it was drawn) and the start itself. One
+    figure per setting the sweep varied besides the start (see _start_groups).
+    """
+    organizing, groups, base_caption = _start_groups(path)
+    percent = f"{threshold * 100:g}%"
+    figures = []
+
+    for values, group in groups:
+        successes = np.array([float(row["success"]) for row in group])
+        passed = successes >= threshold
+        n = len(group)
+
+        labels = []
+        for i, row in enumerate(group, start=1):
+            x, y, z = _parsed("initial_condition", row)
+            seed = _parsed("seed", row)
+            where = f"({x:.3f}, {y:.3f}, {z:.3f})"
+            labels.append(
+                f"{i} | seed {seed} | {where}" if seed is not None else f"{i} | {where}"
+            )
+
+        fig, ax = plt.subplots(figsize=(max(8, 0.55 * n + 2), 7))
+        positions = np.arange(1, n + 1)
+        bars = ax.bar(
+            positions,
+            successes * 100,
+            width=0.78,
+            color=np.where(passed, SUCCEEDED_COLOR, FAILED_COLOR),
+        )
+        ax.bar_label(
+            bars, labels=[f"{s * 100:.1f}%" for s in successes], padding=3, fontsize=8
+        )
+        ax.axhline(threshold * 100, color="black", linestyle="--", linewidth=1.2)
+
+        ax.set_xticks(positions, labels, rotation=90, fontsize=8)
+        ax.set_xlim(0.4, n + 0.6)
+        # headroom over the 100% line for the legend, so it never covers a bar
+        ax.set_ylim(0, 122)
+        ax.set_yticks(range(0, 101, 20))
+        ax.set_ylabel("success (% of time x > 0)")
+        ax.set_xlabel("start | seed | initial condition (x₀, y₀, z₀)")
+        ax.yaxis.grid(True, alpha=0.3)
+        ax.set_axisbelow(True)
+        ax.legend(
+            handles=_threshold_handles(threshold),
+            loc="upper center",
+            ncol=3,
+            fontsize=9,
+            frameon=False,
+        )
+
+        title = f"Success by start\n{passed.sum()}/{n} starts reach ≥{percent}"
+        if values:
+            title += "   ·   " + _setting_label(values)
+        ax.set_title(title)
+
+        print(
+            "success by start"
+            + (f"  {_setting_label(values)}" if values else "")
+            + f": {passed.sum()}/{n} reach ≥{percent}, mean {successes.mean():.4f}"
+        )
+        figures.append((fig, values, dict(base_caption, mean=f"{successes.mean():.3f}")))
+
+    _finish_start_figures(path, "success_by_start", organizing, figures, save)
+
+
+# bins of 0.05: fine enough to tell a controller that shifts the distribution
+# from one that merely widens it, coarse enough that 100 starts still pile up
+OCCUPANCY_BIN_WIDTH = 0.05
+
+
+def zero_forcing_success(starts, horizon, integrator=rk4_step):
+    """Each start's success with no control at all: the baseline to beat."""
+    starts = np.asarray(starts, dtype=float)
+    zeros = np.zeros(len(starts))
+    steps = round(horizon / (LYAPUNOV_EXP * DT))
+    traj, _ = rollout_numpy_batched(
+        starts, np.zeros_like(starts), zeros, steps=steps, integrator=integrator
+    )
+
+    return success_fraction(traj)
+
+
+def plot_occupancy_histogram(path, save=False):
+    """How occupancy is distributed over the starts, against no control at all.
+
+    A step outline of each setting the sweep varied, over the same starts run
+    uncontrolled as the baseline. Uncontrolled, the attractor splits its time
+    between the lobes, so the baseline sits around 0.5; a controller that
+    works moves its whole outline right, one that helps only some starts
+    stretches it. Each setting gets its own panel, sharing both axes, rather
+    than all of them overlaid: settings that work all pile into the top bin,
+    and overlaid there the outline drawn last hides the others.
+
+    The plot horizon is the exception: occupancy over 5 Lyapunov times and
+    over 20 are different measurements, so each horizon gets its own figure,
+    an occupancy_histogram/ directory when there is more than one.
+    """
+    rows, columns, varying = read_sweep_csv(path)
+    overlaid = [
+        name for name in varying if name not in ENSEMBLE_KEYS and name != "plot_horizon"
+    ]
+    page_keys = ["plot_horizon"] if "plot_horizon" in varying else []
+
+    pages = {}
+    for row in rows:
+        page = tuple(_parsed(name, row) for name in page_keys)
+        line = tuple(_parsed(name, row) for name in overlaid)
+        pages.setdefault(page, {}).setdefault(line, []).append(row)
+
+    caption = {}
+    for name in columns:
+        value = BY_NAME[name].parse(rows[0][name])
+        if name not in varying and value is not None:
+            caption[name] = BY_NAME[name].show(value)
+    caption["dt"] = DT
+
+    bins = np.arange(0, 1 + OCCUPANCY_BIN_WIDTH / 2, OCCUPANCY_BIN_WIDTH)
+    colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    figures = []
+
+    for page, lines in pages.items():
+        values = dict(zip(page_keys, page))
+        page_rows = [row for group in lines.values() for row in group]
+        horizon = float(_parsed("plot_horizon", page_rows[0]))
+        integrator = rk4_step if _parsed("rk4", page_rows[0]) else euler_step
+
+        # every start the page used, once, however many settings shared it
+        starts = list(
+            dict.fromkeys(tuple(_parsed("initial_condition", r)) for r in page_rows)
+        )
+        baseline = zero_forcing_success(starts, horizon, integrator)
+
+        # a panel per setting: outlines that all pile into the top bin draw
+        # over one another, and the one drawn last hides the rest
+        n_cols = min(3, len(lines))
+        n_rows = -(-len(lines) // n_cols)
+        single = len(lines) == 1
+        fig, axes = plt.subplots(
+            n_rows,
+            n_cols,
+            figsize=(10, 5) if single else (4.4 * n_cols, 3.1 * n_rows + 0.9),
+            sharex=True,
+            sharey=True,
+            squeeze=False,
+        )
+        grid = axes.ravel()
+
+        for i, (ax, (line, group)) in enumerate(zip(grid, lines.items())):
+            label = _setting_label(dict(zip(overlaid, line))) or "controlled"
+            successes = [float(row["success"]) for row in group]
+            ax.hist(
+                baseline,
+                bins=bins,
+                histtype="step",
+                linewidth=2,
+                color="0.25",
+                label=f"zero forcing (n={len(starts)})",
+            )
+            ax.hist(
+                successes,
+                bins=bins,
+                histtype="step",
+                linewidth=2,
+                color=colors[0],
+                label=f"controlled (n={len(group)})",
+            )
+            ax.axvline(
+                0.5, color="gray", linestyle="--", linewidth=1, label="50% reference"
+            )
+            ax.set_xlim(0, 1)
+            ax.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
+            ax.grid(alpha=0.25)
+
+            if not single:
+                ax.set_title(
+                    f"{label}   (n={len(group)}, mean {np.mean(successes):.3f})",
+                    fontsize=10,
+                )
+            if i % n_cols == 0:
+                ax.set_ylabel("Number of initial conditions")
+            # the bottom panel of each column, which is not always the last row
+            if i + n_cols >= len(lines):
+                ax.set_xlabel("Fraction of time in positive lobe (x > 0)")
+                ax.tick_params(labelbottom=True)
+            if i == 0:
+                ax.legend(loc="upper left", fontsize=9 if single else 8)
+
+        for ax in grid[len(lines) :]:
+            ax.set_visible(False)
+
+        title = f"Positive-lobe occupancy over {horizon:g} Lyapunov times per IC"
+        if single:
+            grid[0].set_title(title)
+        else:
+            fig.suptitle(title)
+
+        print(
+            f"occupancy over {horizon:g} LT: zero forcing mean {baseline.mean():.4f}"
+            + "".join(
+                f", {_setting_label(dict(zip(overlaid, line))) or 'controlled'} mean "
+                f"{np.mean([float(r['success']) for r in group]):.4f}"
+                for line, group in lines.items()
+            )
+        )
+        figures.append((fig, values, dict(caption, bin=f"{OCCUPANCY_BIN_WIDTH:g}")))
+
+    _finish_start_figures(path, "occupancy_histogram", page_keys, figures, save)
 
 
 def plot_sweep_metric(
